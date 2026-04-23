@@ -1,0 +1,61 @@
+{
+  "name": "@majikah/majik-invoice",
+  "type": "module",
+  "description": "Domain model for post-quantum secured invoices — base GeneralInvoice with double-entry accounting projections, and MajikInvoice with hybrid Ed25519 + ML-DSA-87 signing and optional ML-KEM-768 encryption.",
+  "version": "0.0.1",
+  "license": "Apache-2.0",
+  "author": "Zelijah",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Majikah/majik-invoice.git"
+  },
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/jedlsf"
+  },
+  "keywords": [
+    "invoice",
+    "accounting",
+    "double-entry",
+    "journal-entry",
+    "post-quantum",
+    "cryptography",
+    "digital-signature",
+    "ed25519",
+    "ml-dsa",
+    "ml-kem",
+    "encryption",
+    "majikah",
+    "majik",
+    "finance",
+    "tax",
+    "vat",
+    "bir",
+    "philippines",
+    "typescript",
+    "esm"
+  ],
+  "homepage": "https://github.com/Majikah/majik-invoice#readme",
+  "bugs": {
+    "url": "https://github.com/Majikah/majik-invoice/issues"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@majikah/majik-envelope": "^0.0.1",
+    "@majikah/majik-key": "^0.2.6",
+    "@majikah/majik-invoice": "^0.0.17",
+    "@stablelib/sha256": "^2.0.1",
+    "@thezelijah/majik-money": "^1.0.4",
+    "uuid": "^14.0.0"
+  }
+}
