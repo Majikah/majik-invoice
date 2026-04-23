@@ -59,7 +59,14 @@ import {
   PublicInvoiceSummary,
   SignedOnlyPayload,
 } from "./types";
-import { MajikInvoiceEncryptionError, MajikInvoiceError, MajikInvoiceKeyError, MajikInvoiceSealError, MajikInvoiceSerializationError, MajikInvoiceSignatureError } from "./errors";
+import {
+  MajikInvoiceEncryptionError,
+  MajikInvoiceError,
+  MajikInvoiceKeyError,
+  MajikInvoiceSealError,
+  MajikInvoiceSerializationError,
+  MajikInvoiceSignatureError,
+} from "./errors";
 
 // ---------------------------------------------------------------------------
 // Schema version
@@ -1310,10 +1317,11 @@ export class MajikInvoice {
    */
   private static _sha256Hex(bytes: Uint8Array): string {
     const hashed = hash(bytes);
-    const hexHash = hashed.toHex();
+    const hexHash = Array.from(hashed)
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
     return hexHash;
   }
-
   /**
    * Get the plaintext GeneralInvoice for operations that require it.
    * Handles signed-only mode and decrypted cache; throws if encrypted and not cached.

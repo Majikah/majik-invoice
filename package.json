@@ -53,7 +53,7 @@
   "dependencies": {
     "@majikah/majik-envelope": "^0.0.1",
     "@majikah/majik-key": "^0.2.6",
-    "@majikah/majik-invoice": "^0.0.17",
+    "@majikah/majik-signature": "^0.0.17",
     "@stablelib/sha256": "^2.0.1",
     "@thezelijah/majik-money": "^1.0.4",
     "uuid": "^14.0.0"
