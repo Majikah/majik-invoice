@@ -253,7 +253,7 @@ import { MajikInvoice } from "@majikah/majik-invoice";
 const invoice = await MajikInvoice.create({
   mode: "signed-only",
   signerKey: aliceKey,
-  issuer: { legalName: "Alice Co", tin: "123-456-789-000" },
+  issuer: { legalName: "Alice Corporation", tin: "123-456-789-000" },
   recipient: { legalName: "Bob Inc" },
   currency: "PHP",
   defaultTax: { taxType: "VAT", rate: 0.12 },
