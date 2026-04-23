@@ -10,6 +10,37 @@ Part of the [Majikah](https://github.com/Majikah) ecosystem.
 ![npm](https://img.shields.io/npm/v/@majikah/majik-invoice) ![npm downloads](https://img.shields.io/npm/dm/@majikah/majik-invoice) ![npm bundle size](https://img.shields.io/bundlephobia/min/%40majikah%2Fmajik-invoice) [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0) ![TypeScript](https://img.shields.io/badge/TypeScript-Ready-blue)
 
 
+----
+
+- [Majik Invoice](#majik-invoice)
+  - [Overview](#overview)
+  - [Features](#features)
+  - [Installation](#installation)
+    - [Peer dependencies](#peer-dependencies)
+  - [Usage](#usage)
+    - [GeneralInvoice — basic](#generalinvoice--basic)
+    - [GeneralInvoice — with\* mutation](#generalinvoice--with-mutation)
+    - [GeneralInvoice — updating a line item](#generalinvoice--updating-a-line-item)
+    - [GeneralInvoice — tax operations](#generalinvoice--tax-operations)
+    - [GeneralInvoice — accounting projections](#generalinvoice--accounting-projections)
+    - [GeneralInvoice — lifecycle](#generalinvoice--lifecycle)
+    - [MajikInvoice — signed-only](#majikinvoice--signed-only)
+    - [MajikInvoice — encrypted-and-signed](#majikinvoice--encrypted-and-signed)
+    - [MajikInvoice — multi-sig with allowlist](#majikinvoice--multi-sig-with-allowlist)
+    - [MajikInvoice — reissue after changes](#majikinvoice--reissue-after-changes)
+  - [Error types](#error-types)
+  - [Accounting branch support](#accounting-branch-support)
+  - [Serialization](#serialization)
+  - [Related Projects](#related-projects)
+    - [Majik Key](#majik-key)
+    - [Majik Signature](#majik-signature)
+    - [Majik Envelope](#majik-envelope)
+  - [Contributing](#contributing)
+  - [License](#license)
+  - [Author](#author)
+  - [Contact](#contact)
+
+
 ---
 
 ## Overview
