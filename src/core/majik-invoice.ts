@@ -197,7 +197,7 @@ export class MajikInvoice {
     // ── 1. Build the base GeneralInvoice ────────────────────────────────────
     const {
       mode: _m,
-      recipientKeys,
+      recipients,
       signerKey,
       expectedSigners,
       ...generalInput
@@ -215,15 +215,15 @@ export class MajikInvoice {
     let payload: MajikInvoicePayload;
 
     if (mode === "encrypted-and-signed") {
-      if (!recipientKeys || recipientKeys.length === 0) {
+      if (!recipients || recipients.length === 0) {
         throw new MajikInvoiceKeyError(
-          "recipientKeys are required when mode is 'encrypted-and-signed'.",
+          "recipients are required when mode is 'encrypted-and-signed'.",
         );
       }
 
       payload = await MajikInvoice._buildEncryptedPayload(
         generalInvoice,
-        recipientKeys,
+        recipients,
         input.signerKey,
       );
     } else {
@@ -276,7 +276,7 @@ export class MajikInvoice {
    * @throws {MajikInvoiceKeyError} if recipientKeys are locked or missing
    */
   async toEncrypted(
-    recipientKeys: MajikKey[],
+    recipients: MajikRecipient[],
     signerKey?: MajikKey,
   ): Promise<MajikInvoice> {
     if (this.mode === "encrypted-and-signed") {
@@ -288,7 +288,7 @@ export class MajikInvoice {
     const generalInvoice = this._requirePlaintextInvoice("toEncrypted");
     const payload = await MajikInvoice._buildEncryptedPayload(
       generalInvoice,
-      recipientKeys,
+      recipients,
       signerKey,
     );
 
@@ -464,14 +464,14 @@ export class MajikInvoice {
     options: {
       signerKey?: MajikKey;
       /** Required when mode is "encrypted-and-signed" */
-      recipientKeys?: MajikKey[];
+      recipients?: MajikRecipient[];
       expectedSigners?: ExpectedSigner[];
     } = {},
   ): Promise<MajikInvoice> {
     if (this.mode === "encrypted-and-signed") {
-      if (!options.recipientKeys || options.recipientKeys.length === 0) {
+      if (!options.recipients || options.recipients.length === 0) {
         throw new MajikInvoiceKeyError(
-          "recipientKeys are required to reissue an encrypted-and-signed invoice.",
+          "recipients are required to reissue an encrypted-and-signed invoice.",
         );
       }
     }
@@ -489,7 +489,7 @@ export class MajikInvoice {
     if (this.mode === "encrypted-and-signed") {
       payload = await MajikInvoice._buildEncryptedPayload(
         updatedInvoice,
-        options.recipientKeys!,
+        options.recipients!,
       );
     } else {
       payload = {
@@ -549,7 +549,7 @@ export class MajikInvoice {
     targetMode: MajikInvoiceMode,
     options: {
       /** Required when converting TO "encrypted-and-signed" */
-      recipientKeys?: MajikKey[];
+      recipients?: MajikRecipient[];
       /** Required when converting FROM "encrypted-and-signed" */
       decryptKey?: MajikKey;
       /** Optional — re-signs the converted invoice immediately */
@@ -564,12 +564,12 @@ export class MajikInvoice {
     }
 
     if (targetMode === "encrypted-and-signed") {
-      if (!options.recipientKeys || options.recipientKeys.length === 0) {
+      if (!options.recipients || options.recipients.length === 0) {
         throw new MajikInvoiceKeyError(
-          `recipientKeys are required when converting to "encrypted-and-signed" mode.`,
+          `recipients are required when converting to "encrypted-and-signed" mode.`,
         );
       }
-      return this.toEncrypted(options.recipientKeys, options.signerKey);
+      return this.toEncrypted(options.recipients, options.signerKey);
     }
 
     // targetMode === "signed-only"
@@ -597,10 +597,10 @@ export class MajikInvoice {
    * @throws {MajikInvoiceEncryptionError} if encryption fails
    */
   async encrypt(
-    recipientKeys: MajikKey[],
+    recipients: MajikRecipient[],
     signerKey?: MajikKey,
   ): Promise<MajikInvoice> {
-    return this.setMode("encrypted-and-signed", { recipientKeys, signerKey });
+    return this.setMode("encrypted-and-signed", { recipients, signerKey });
   }
 
   /**
@@ -1340,33 +1340,18 @@ export class MajikInvoice {
    */
   private static async _buildEncryptedPayload(
     invoice: GeneralInvoice,
-    recipientKeys: MajikKey[],
+    recipients: MajikRecipient[],
     _signerKey?: MajikKey,
   ): Promise<EncryptedPayload> {
-    if (!recipientKeys || recipientKeys.length === 0) {
+    if (!recipients || recipients.length === 0) {
       throw new MajikInvoiceKeyError(
-        "At least one recipient key is required for encryption.",
+        "At least one recipient is required for encryption.",
       );
     }
 
-    const recipients: MajikRecipient[] = recipientKeys.map((k) => {
-      if (!k.hasMlKem) {
-        throw new MajikInvoiceKeyError(
-          `Recipient key "${k.fingerprint}" has no ML-KEM public key. ` +
-            `Key must be fully upgraded via importFromMnemonicBackup().`,
-        );
-      }
-      return {
-        fingerprint: k.fingerprint,
-        mlKemPublicKey: k.mlKemPublicKey,
-      };
-    });
-
     const plaintext = JSON.stringify(invoice.toJSON());
     const senderFingerprint =
-      recipientKeys.length > 1
-        ? (recipientKeys[0]?.fingerprint ?? "")
-        : undefined;
+      recipients.length > 1 ? (recipients[0]?.fingerprint ?? "") : undefined;
 
     try {
       const envelope = await MajikEnvelope.encrypt({
@@ -1475,9 +1460,9 @@ export class MajikInvoice {
     }
 
     if (mode === "encrypted-and-signed") {
-      if (!input.recipientKeys || input.recipientKeys.length === 0) {
+      if (!input.recipients || input.recipients.length === 0) {
         throw new MajikInvoiceKeyError(
-          `recipientKeys are required when mode is "encrypted-and-signed".`,
+          `recipients are required when mode is "encrypted-and-signed".`,
         );
       }
     }

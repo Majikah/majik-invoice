@@ -16,6 +16,7 @@ import type {
   MajikSignatureJSON,
   SealInfo,
 } from "@majikah/majik-signature";
+import { MajikRecipient } from "@majikah/majik-envelope";
 
 export type MajikInvoiceMode = "signed-only" | "encrypted-and-signed";
 
@@ -138,11 +139,10 @@ export interface MajikInvoiceInput extends GeneralInvoiceInput {
   mode?: MajikInvoiceMode;
   /**
    * Required when mode is "encrypted-and-signed".
-   * The MajikKey belonging to the recipient(s).
    * Single key = single-recipient envelope.
    * Multiple keys = group envelope (MajikEnvelope group mode).
    */
-  recipientKeys?: MajikKey[];
+  recipients?: MajikRecipient[];
   /**
    * The signing key. Required unless you intend to sign later via sign().
    * Must be unlocked.

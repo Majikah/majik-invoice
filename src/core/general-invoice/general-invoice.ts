@@ -62,6 +62,7 @@ import {
   DEFAULT_ACCOUNTS,
   SCHEMA_VERSION,
 } from "./constants";
+import { MajikInvoiceInput } from "../types";
 
 // ---------------------------------------------------------------------------
 // GeneralInvoice
@@ -1660,6 +1661,40 @@ export class GeneralInvoice {
   // ==========================================================================
   // ── SERIALIZATION ──────────────────────────────────────────────────────────
   // ==========================================================================
+
+  toMajikInvoiceInput(): MajikInvoiceInput {
+    return {
+      id: this.id,
+      invoiceNumber: this.invoiceNumber,
+      type: this.type,
+      status: this.status,
+      issuer: this.issuer,
+      recipient: this.recipient,
+      currency: this.currency,
+      issueDate: this.issueDate,
+      dueDate: this.dueDate,
+      period: this.period,
+      paymentTerms: this.paymentTerms,
+      lineItems: this.lineItems.map((li) => ({
+        id: li.id,
+        description: li.description,
+        quantity: li.quantity,
+        unitPrice: li.unitPrice.toMajor(),
+        unit: li.unit,
+        tax: li.tax,
+        discount: li.discount,
+        accountCode: li.accountCode,
+        costCenter: li.costCenter,
+        tags: li.tags,
+        metadata: li.metadata,
+      })),
+      defaultTax: this.defaultTax,
+      references: this.references ? [...this.references] : undefined,
+      notes: this.notes,
+      tags: this.tags,
+      metadata: this.metadata,
+    };
+  }
 
   toJSON(): GeneralInvoiceJSON {
     return {
