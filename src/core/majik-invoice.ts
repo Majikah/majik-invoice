@@ -528,6 +528,97 @@ export class MajikInvoice {
   }
 
   // ==========================================================================
+  // ── MODE SETTING ───────────────────────────────────────────────────────────
+  // ==========================================================================
+
+  /**
+   * Set the mode of this invoice, returning a NEW MajikInvoice.
+   * The original is untouched. All existing signatures are cleared — re-sign
+   * after conversion.
+   *
+   * - "signed-only"          → requires decryptKey if currently encrypted
+   * - "encrypted-and-signed" → requires recipientKeys
+   *
+   * Optionally re-sign immediately by providing signerKey.
+   *
+   * @throws {MajikInvoiceError}          if the target mode is already active
+   * @throws {MajikInvoiceKeyError}       if required keys are missing or locked
+   * @throws {MajikInvoiceEncryptionError} if decryption or encryption fails
+   */
+  async setMode(
+    targetMode: MajikInvoiceMode,
+    options: {
+      /** Required when converting TO "encrypted-and-signed" */
+      recipientKeys?: MajikKey[];
+      /** Required when converting FROM "encrypted-and-signed" */
+      decryptKey?: MajikKey;
+      /** Optional — re-signs the converted invoice immediately */
+      signerKey?: MajikKey;
+      expectedSigners?: ExpectedSigner[];
+    } = {},
+  ): Promise<MajikInvoice> {
+    if (this.mode === targetMode) {
+      throw new MajikInvoiceError(
+        `Invoice is already in "${targetMode}" mode.`,
+      );
+    }
+
+    if (targetMode === "encrypted-and-signed") {
+      if (!options.recipientKeys || options.recipientKeys.length === 0) {
+        throw new MajikInvoiceKeyError(
+          `recipientKeys are required when converting to "encrypted-and-signed" mode.`,
+        );
+      }
+      return this.toEncrypted(options.recipientKeys, options.signerKey);
+    }
+
+    // targetMode === "signed-only"
+    if (this.mode === "encrypted-and-signed") {
+      if (!options.decryptKey) {
+        throw new MajikInvoiceKeyError(
+          `decryptKey is required when converting from "encrypted-and-signed" to "signed-only".`,
+        );
+      }
+      return this.toSignedOnly(options.decryptKey, options.signerKey);
+    }
+
+    // Unreachable given the two-value union, but keeps TS happy
+    throw new MajikInvoiceError(`Unrecognised target mode "${targetMode}".`);
+  }
+
+  // ── Quick-access wrappers ─────────────────────────────────────────────────
+
+  /**
+   * Convert to "encrypted-and-signed" mode.
+   * Thin wrapper over {@link setMode}.
+   *
+   * @throws {MajikInvoiceError}           if already encrypted
+   * @throws {MajikInvoiceKeyError}        if recipientKeys are missing or locked
+   * @throws {MajikInvoiceEncryptionError} if encryption fails
+   */
+  async encrypt(
+    recipientKeys: MajikKey[],
+    signerKey?: MajikKey,
+  ): Promise<MajikInvoice> {
+    return this.setMode("encrypted-and-signed", { recipientKeys, signerKey });
+  }
+
+  /**
+   * Convert to "signed-only" (plaintext) mode.
+   * Thin wrapper over {@link setMode}.
+   *
+   * @throws {MajikInvoiceError}           if already signed-only
+   * @throws {MajikInvoiceKeyError}        if decryptKey is missing or locked
+   * @throws {MajikInvoiceEncryptionError} if decryption fails
+   */
+  async decrypt_mode(
+    decryptKey: MajikKey,
+    signerKey?: MajikKey,
+  ): Promise<MajikInvoice> {
+    return this.setMode("signed-only", { decryptKey, signerKey });
+  }
+
+  // ==========================================================================
   // ── ENCRYPTION & DECRYPTION ────────────────────────────────────────────────
   // ==========================================================================
 
