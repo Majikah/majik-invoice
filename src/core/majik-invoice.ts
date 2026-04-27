@@ -374,10 +374,11 @@ export class MajikInvoice {
   /**
    * Runtime posture of this invoice.
    *
-   * "sealed"    — at least one signature present
-   * "unsigned"  — no signatures yet
-   * "decrypted" — encrypted invoice with active decrypted cache
-   * "invalid"   — failed structural validation
+   * "sealed"    — sealed and signed  (encrypted or plaintext)
+   * "signed"    — at least one valid signature present AND allowlist (if any) satisfied
+   * "unsigned"  — invoice created but no signatures attached yet
+   * "decrypted" — was encrypted; has been decrypted in this session (cached)
+   * "invalid"   — structural or cryptographic verification failed
    */
   get status(): MajikInvoiceStatus {
     try {
@@ -387,9 +388,40 @@ export class MajikInvoice {
       return "invalid";
     }
 
-    if (this._decrypted) return "decrypted";
-    if (this.integrity.signatures.length > 0) return "sealed";
-    return "unsigned";
+    if (this.integrity.signatures.length === 0) {
+      return "unsigned";
+    }
+
+    if (this.integrity.isSealed) {
+      return "sealed";
+    }
+
+    if (this.isFullySigned) {
+      return "fully-signed";
+    }
+
+    return "partially-signed";
+  }
+
+  get displayStatus(): string {
+    if (this.status === "invalid") return "Invalid";
+    if (this.status === "unsigned") return "Unsigned";
+
+    if (this.status === "partially-signed") {
+      return this.isEncrypted
+        ? "Partially Signed (Encrypted)"
+        : "Partially Signed";
+    }
+
+    if (this.status === "fully-signed") {
+      return this.isEncrypted ? "Fully Signed (Encrypted)" : "Fully Signed";
+    }
+
+    if (this.status === "sealed") {
+      return this.isEncrypted ? "Sealed (Encrypted)" : "Sealed";
+    }
+
+    return "Unknown";
   }
 
   get isEncrypted(): boolean {
@@ -444,6 +476,10 @@ export class MajikInvoice {
     throw new MajikInvoiceError(
       "Invoice payload is encrypted. Call decrypt(key) first to access the full GeneralInvoice.",
     );
+  }
+
+  get summary(): PublicInvoiceSummary {
+    return this.public;
   }
 
   /**

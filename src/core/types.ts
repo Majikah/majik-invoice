@@ -27,16 +27,18 @@ export type MajikInvoiceMode = "signed-only" | "encrypted-and-signed";
 /**
  * Runtime posture of the MajikInvoice.
  *
- * "sealed"    — at least one valid signature present (encrypted or plaintext)
+ * "sealed"    — sealed and signed  (encrypted or plaintext)
+ * "signed"    — at least one valid signature present AND allowlist (if any) satisfied
  * "unsigned"  — invoice created but no signatures attached yet
  * "decrypted" — was encrypted; has been decrypted in this session (cached)
  * "invalid"   — structural or cryptographic verification failed
  */
 export type MajikInvoiceStatus =
-  | "sealed"
+  | "invalid"
   | "unsigned"
-  | "decrypted"
-  | "invalid";
+  | "partially-signed"
+  | "fully-signed"
+  | "sealed";
 
 // ---------------------------------------------------------------------------
 // Public summary — always plaintext, always present
