@@ -16,6 +16,18 @@
  *  - fromJSON() rehydrates all MajikMoneyJSON back to MajikMoney
  *  - toCanonicalBytes() is deterministic — safe for signing
  *  - Projection methods always return status: "draft"
+ *
+ * Tax modes:
+ *  - Exclusive (default): tax is added on top of the unit price.
+ *      taxAmount = lineTotal × rate
+ *      grandTotal = lineTotal + taxAmount
+ *  - Inclusive: tax is embedded in the unit price; the grand total stays the
+ *    same but the tax amount is extracted from it.
+ *      taxAmount = lineTotal − (lineTotal / (1 + rate))
+ *      grandTotal = lineTotal  (unchanged)
+ *
+ *  Use withInclusiveTax(taxType?) / withExclusiveTax(taxType?) to toggle.
+ *  Both methods operate on draft invoices only and recompute totals.
  */
 
 import {
@@ -167,11 +179,6 @@ export class GeneralInvoice {
 
   // ── Internal rebuild ──────────────────────────────────────────────────────
 
-  /**
-   * Rebuilds a new GeneralInvoice from the current state with selected
-   * fields overridden. Recomputes totals from line items.
-   * Always stamps a fresh updatedAt.
-   */
   private rebuild(
     overrides: Partial<InvoiceInternalState>,
     lineItems?: LineItem[],
@@ -208,10 +215,6 @@ export class GeneralInvoice {
 
   // ── Guards ────────────────────────────────────────────────────────────────
 
-  /**
-   * Assert the invoice is not void. Voided invoices are terminal.
-   * @throws {InvoiceMutationError}
-   */
   private assertEditable(operation: string): void {
     if (this.status === "void") {
       throw new InvoiceMutationError(
@@ -221,11 +224,6 @@ export class GeneralInvoice {
     }
   }
 
-  /**
-   * Assert the invoice is in draft status.
-   * Structural mutations (line items, tax, dates) require draft.
-   * @throws {InvoiceMutationError}
-   */
   private assertDraft(operation: string): void {
     if (this.status !== "draft") {
       throw new InvoiceMutationError(
@@ -238,15 +236,6 @@ export class GeneralInvoice {
 
   // ── Static factory ────────────────────────────────────────────────────────
 
-  /**
-   * Create a validated, immutable GeneralInvoice.
-   *
-   * Totals are auto-computed from line items.
-   * Line items with no explicit tax inherit from defaultTax.
-   *
-   * @throws {InvoiceValidationError} if input is invalid
-   * @throws {LineItemValidationError} if any line item is invalid
-   */
   static create(input: GeneralInvoiceInput): GeneralInvoice {
     GeneralInvoice.assertValid(input);
 
@@ -281,53 +270,23 @@ export class GeneralInvoice {
 
   // ==========================================================================
   // ── WITH* MUTATION METHODS ─────────────────────────────────────────────────
-  // Every method returns a NEW GeneralInvoice. The original is untouched.
-  //
-  // Rules:
-  //   assertEditable  — required for supplementary changes (notes, tags, etc.)
-  //   assertDraft     — required for structural changes (line items, tax, dates)
   // ==========================================================================
 
   // ── Identity & metadata ───────────────────────────────────────────────────
 
-  /**
-   * Set or replace the human-readable invoice number.
-   *
-   * @throws {InvoiceMutationError} if invoice is void
-   * @throws {InvoiceValidationError} if number is empty
-   */
   withInvoiceNumber(invoiceNumber: string): GeneralInvoice {
     this.assertEditable("set invoice number");
-
     if (!invoiceNumber || invoiceNumber.trim().length === 0) {
       throw new InvoiceValidationError(
         "Invoice number cannot be empty",
         "invoiceNumber",
       );
     }
-
     return this.rebuild({ invoiceNumber: invoiceNumber.trim() });
   }
 
-  /**
-   * Transition to a new lifecycle status.
-   *
-   * Allowed transitions:
-   *   draft    → draft | issued | void
-   *   issued   → sent | viewed | partial | paid | disputed | void
-   *   sent     → viewed | partial | paid | disputed | void
-   *   viewed   → partial | paid | disputed | void
-   *   partial  → paid | disputed | void
-   *   paid     → void
-   *   overdue  → paid | partial | disputed | void
-   *   disputed → issued | void
-   *   void     → (terminal)
-   *
-   * @throws {InvoiceLifecycleError} if transition is not permitted
-   */
   withStatus(status: InvoiceStatus): GeneralInvoice {
     if (this.status === status) return this;
-
     const allowed = ALLOWED_TRANSITIONS[this.status];
     if (!allowed.includes(status)) {
       throw new InvoiceLifecycleError(
@@ -337,48 +296,27 @@ export class GeneralInvoice {
         status,
       );
     }
-
     return this.rebuild({ status });
   }
 
-  /**
-   * Set or replace free-form notes.
-   *
-   * @throws {InvoiceMutationError} if invoice is void
-   */
   withNotes(notes: string): GeneralInvoice {
     this.assertEditable("set notes");
-
     if (typeof notes !== "string") {
       throw new InvoiceValidationError("Notes must be a string", "notes");
     }
-
     return this.rebuild({ notes: notes.trim() });
   }
 
-  /**
-   * Clear notes.
-   *
-   * @throws {InvoiceMutationError} if invoice is void
-   */
   withoutNotes(): GeneralInvoice {
     this.assertEditable("clear notes");
     return this.rebuild({ notes: undefined });
   }
 
-  /**
-   * Replace all tags. Duplicates are removed automatically.
-   *
-   * @throws {InvoiceMutationError} if invoice is void
-   * @throws {InvoiceValidationError} if any tag is empty
-   */
   withTags(tags: string[]): GeneralInvoice {
     this.assertEditable("set tags");
-
     if (!Array.isArray(tags)) {
       throw new InvoiceValidationError("Tags must be an array", "tags");
     }
-
     const cleaned = tags.map((t, i) => {
       if (typeof t !== "string" || t.trim().length === 0) {
         throw new InvoiceValidationError(
@@ -388,35 +326,20 @@ export class GeneralInvoice {
       }
       return t.trim();
     });
-
     return this.rebuild({ tags: [...new Set(cleaned)] });
   }
 
-  /**
-   * Append a single tag. No-op if already present.
-   *
-   * @throws {InvoiceMutationError} if invoice is void
-   * @throws {InvoiceValidationError} if tag is empty
-   */
   withTag(tag: string): GeneralInvoice {
     this.assertEditable("add tag");
-
     if (!tag || tag.trim().length === 0) {
       throw new InvoiceValidationError("Tag cannot be empty", "tag");
     }
-
     const existing = this.tags ?? [];
     const trimmed = tag.trim();
     if (existing.includes(trimmed)) return this;
-
     return this.rebuild({ tags: [...existing, trimmed] });
   }
 
-  /**
-   * Remove a specific tag by value.
-   *
-   * @throws {InvoiceMutationError} if invoice is void
-   */
   withoutTag(tag: string): GeneralInvoice {
     this.assertEditable("remove tag");
     return this.rebuild({
@@ -424,23 +347,14 @@ export class GeneralInvoice {
     });
   }
 
-  /**
-   * Deep-merge metadata. Existing keys are overwritten; pass `null` to remove a key.
-   *
-   * @example invoice.withMetadata({ projectId: "abc", region: null })
-   * @throws {InvoiceMutationError} if invoice is void
-   * @throws {InvoiceValidationError} if patch is not a plain object
-   */
   withMetadata(patch: Record<string, unknown>): GeneralInvoice {
     this.assertEditable("update metadata");
-
     if (typeof patch !== "object" || Array.isArray(patch) || patch === null) {
       throw new InvoiceValidationError(
         "Metadata patch must be a plain object",
         "metadata",
       );
     }
-
     const merged: Record<string, unknown> = { ...(this.metadata ?? {}) };
     for (const [key, value] of Object.entries(patch)) {
       if (value === null) {
@@ -449,19 +363,11 @@ export class GeneralInvoice {
         merged[key] = value;
       }
     }
-
     return this.rebuild({ metadata: merged });
   }
 
-  /**
-   * Replace all metadata entirely.
-   *
-   * @throws {InvoiceMutationError} if invoice is void
-   * @throws {InvoiceValidationError} if value is not a plain object
-   */
   withMetadataReplaced(metadata: Record<string, unknown>): GeneralInvoice {
     this.assertEditable("replace metadata");
-
     if (
       typeof metadata !== "object" ||
       Array.isArray(metadata) ||
@@ -472,15 +378,9 @@ export class GeneralInvoice {
         "metadata",
       );
     }
-
     return this.rebuild({ metadata: { ...metadata } });
   }
 
-  /**
-   * Clear all metadata.
-   *
-   * @throws {InvoiceMutationError} if invoice is void
-   */
   withoutMetadata(): GeneralInvoice {
     this.assertEditable("clear metadata");
     return this.rebuild({ metadata: undefined });
@@ -488,124 +388,72 @@ export class GeneralInvoice {
 
   // ── Dates & terms ─────────────────────────────────────────────────────────
 
-  /**
-   * Set the issue date.
-   *
-   * @param date - ISO 8601 (YYYY-MM-DD)
-   * @throws {InvoiceMutationError} if not draft
-   * @throws {InvoiceValidationError} if format invalid or after dueDate
-   */
   withIssueDate(date: ISODateString): GeneralInvoice {
     this.assertDraft("set issue date");
     GeneralInvoice.assertDateFormat(date, "issueDate");
-
     if (this.dueDate && date > this.dueDate) {
       throw new InvoiceValidationError(
         `issueDate (${date}) cannot be after dueDate (${this.dueDate})`,
         "issueDate",
       );
     }
-
     return this.rebuild({ issueDate: date });
   }
 
-  /**
-   * Set or replace the due date.
-   *
-   * @param date - ISO 8601 (YYYY-MM-DD)
-   * @throws {InvoiceMutationError} if invoice is void
-   * @throws {InvoiceValidationError} if format invalid or before issueDate
-   */
   withDueDate(date: ISODateString): GeneralInvoice {
     this.assertEditable("set due date");
     GeneralInvoice.assertDateFormat(date, "dueDate");
-
     if (date < this.issueDate) {
       throw new InvoiceValidationError(
         `dueDate (${date}) cannot be before issueDate (${this.issueDate})`,
         "dueDate",
       );
     }
-
     return this.rebuild({ dueDate: date });
   }
 
-  /**
-   * Remove the due date.
-   *
-   * @throws {InvoiceMutationError} if invoice is void
-   */
   withoutDueDate(): GeneralInvoice {
     this.assertEditable("remove due date");
     return this.rebuild({ dueDate: undefined });
   }
 
-  /**
-   * Set the billing / service period.
-   *
-   * @throws {InvoiceMutationError} if not draft
-   * @throws {InvoiceValidationError} if dates invalid or inverted
-   */
   withPeriod(period: Period): GeneralInvoice {
     this.assertDraft("set period");
-
     if (!period || typeof period !== "object") {
       throw new InvoiceValidationError("Period must be an object", "period");
     }
-
     GeneralInvoice.assertDateFormat(period.start, "period.start");
     GeneralInvoice.assertDateFormat(period.end, "period.end");
-
     if (period.end < period.start) {
       throw new InvoiceValidationError(
         `period.end (${period.end}) cannot be before period.start (${period.start})`,
         "period",
       );
     }
-
     return this.rebuild({ period: { ...period } });
   }
 
-  /**
-   * Remove the billing period.
-   *
-   * @throws {InvoiceMutationError} if not draft
-   */
   withoutPeriod(): GeneralInvoice {
     this.assertDraft("remove period");
     return this.rebuild({ period: undefined });
   }
 
-  /**
-   * Set payment terms.
-   *
-   * @throws {InvoiceMutationError} if invoice is void
-   */
   withPaymentTerms(terms: PaymentTerms): GeneralInvoice {
     this.assertEditable("set payment terms");
-
     if (!terms) {
       throw new InvoiceValidationError(
         "Payment terms cannot be empty",
         "paymentTerms",
       );
     }
-
     return this.rebuild({ paymentTerms: terms });
   }
 
   // ── References ────────────────────────────────────────────────────────────
 
-  /**
-   * Append a single document reference (PO, contract, audit ref, etc.).
-   *
-   * @throws {InvoiceMutationError} if invoice is void
-   * @throws {InvoiceValidationError} if type or number is empty
-   */
   withReference(ref: DocumentReference): GeneralInvoice {
     this.assertEditable("add reference");
     GeneralInvoice.assertValidReference(ref, "reference");
-
     const existing = this.references ? [...this.references] : [];
     return this.rebuild({
       references: [
@@ -615,37 +463,22 @@ export class GeneralInvoice {
     });
   }
 
-  /**
-   * Replace all document references.
-   *
-   * @throws {InvoiceMutationError} if invoice is void
-   * @throws {InvoiceValidationError} if any reference is invalid
-   */
   withReferences(refs: DocumentReference[]): GeneralInvoice {
     this.assertEditable("replace references");
-
     if (!Array.isArray(refs)) {
       throw new InvoiceValidationError(
         "References must be an array",
         "references",
       );
     }
-
     refs.forEach((ref, i) =>
       GeneralInvoice.assertValidReference(ref, `references[${i}]`),
     );
-
     return this.rebuild({ references: refs.map((r) => ({ ...r })) });
   }
 
-  /**
-   * Remove a document reference matched by type and number.
-   *
-   * @throws {InvoiceMutationError} if invoice is void
-   */
   withoutReference(type: string, number: string): GeneralInvoice {
     this.assertEditable("remove reference");
-
     return this.rebuild({
       references: (this.references ?? []).filter(
         (r) => !(r.type === type && r.number === number),
@@ -653,11 +486,6 @@ export class GeneralInvoice {
     });
   }
 
-  /**
-   * Remove all document references.
-   *
-   * @throws {InvoiceMutationError} if invoice is void
-   */
   withoutReferences(): GeneralInvoice {
     this.assertEditable("clear references");
     return this.rebuild({ references: undefined });
@@ -665,66 +493,38 @@ export class GeneralInvoice {
 
   // ── Line item mutations ───────────────────────────────────────────────────
 
-  /**
-   * Append a single line item. Totals are recomputed.
-   * Inherits defaultTax if the line has no explicit tax.
-   *
-   * @throws {InvoiceMutationError} if not draft
-   * @throws {LineItemValidationError} if input is invalid
-   */
   withLineItem(input: LineItemInput): GeneralInvoice {
     this.assertDraft("add line item");
-
     const resolved: LineItemInput = {
       ...input,
       tax: input.tax ?? this.defaultTax,
     };
-
     const lineItem = LineItem.create(resolved, this.currency);
     return this.rebuild({}, [...this.lineItems, lineItem]);
   }
 
-  /**
-   * Replace all line items. Totals are recomputed.
-   * defaultTax is applied to any line with no explicit tax.
-   *
-   * @throws {InvoiceMutationError} if not draft
-   * @throws {InvoiceValidationError} if array is empty
-   * @throws {LineItemValidationError} if any item is invalid
-   */
   withLineItems(inputs: LineItemInput[]): GeneralInvoice {
     this.assertDraft("replace line items");
-
     if (!Array.isArray(inputs) || inputs.length === 0) {
       throw new InvoiceValidationError(
         "At least one line item is required",
         "lineItems",
       );
     }
-
     const lineItems = inputs.map((li) =>
       LineItem.create({ ...li, tax: li.tax ?? this.defaultTax }, this.currency),
     );
-
     return this.rebuild({}, lineItems);
   }
 
-  /**
-   * Remove a line item by id. Totals are recomputed.
-   *
-   * @throws {InvoiceMutationError} if not draft
-   * @throws {InvoiceValidationError} if id not found or would leave zero items
-   */
   withoutLineItem(id: string): GeneralInvoice {
     this.assertDraft("remove line item");
-
     if (!id || id.trim().length === 0) {
       throw new InvoiceValidationError(
         "Line item id is required",
         "lineItemId",
       );
     }
-
     const exists = this.lineItems.some((li) => li.id === id);
     if (!exists) {
       throw new InvoiceValidationError(
@@ -732,44 +532,29 @@ export class GeneralInvoice {
         "lineItemId",
       );
     }
-
     if (this.lineItems.length === 1) {
       throw new InvoiceValidationError(
         "Cannot remove the last line item. Use withClearedLineItems() then withLineItem() to replace it.",
         "lineItems",
       );
     }
-
     return this.rebuild(
       {},
       this.lineItems.filter((li) => li.id !== id),
     );
   }
 
-  /**
-   * Update specific fields on a line item by id.
-   * Only provided fields change — everything else carries over.
-   * Totals are recomputed.
-   *
-   * @param id - Line item id
-   * @param patch - Partial fields to apply
-   * @throws {InvoiceMutationError} if not draft
-   * @throws {InvoiceValidationError} if id not found or patch is invalid
-   * @throws {LineItemValidationError} if the merged result is invalid
-   */
   withUpdatedLineItem(
     id: string,
     patch: Partial<LineItemInput>,
   ): GeneralInvoice {
     this.assertDraft("update line item");
-
     if (!id || id.trim().length === 0) {
       throw new InvoiceValidationError(
         "Line item id is required",
         "lineItemId",
       );
     }
-
     const existing = this.lineItems.find((li) => li.id === id);
     if (!existing) {
       throw new InvoiceValidationError(
@@ -777,11 +562,9 @@ export class GeneralInvoice {
         "lineItemId",
       );
     }
-
     if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
       throw new InvoiceValidationError("Patch must be a plain object", "patch");
     }
-
     const mergedInput: LineItemInput = {
       id: existing.id,
       description: patch.description ?? existing.description,
@@ -797,19 +580,11 @@ export class GeneralInvoice {
       tags: "tags" in patch ? patch.tags : existing.tags,
       metadata: "metadata" in patch ? patch.metadata : existing.metadata,
     };
-
     const updatedItem = LineItem.create(mergedInput, this.currency);
     const items = this.lineItems.map((li) => (li.id === id ? updatedItem : li));
-
     return this.rebuild({}, items);
   }
 
-  /**
-   * Remove all line items.
-   * The invoice will have zero items — repopulate before projecting.
-   *
-   * @throws {InvoiceMutationError} if not draft
-   */
   withClearedLineItems(): GeneralInvoice {
     this.assertDraft("clear line items");
     return this.rebuild({}, []);
@@ -817,28 +592,16 @@ export class GeneralInvoice {
 
   // ── Tax mutations ─────────────────────────────────────────────────────────
 
-  /**
-   * Set or replace the invoice-level default tax.
-   * Line items that had no explicit tax are re-resolved with the new default.
-   * Line items with their own explicit tax are untouched.
-   *
-   * @throws {InvoiceMutationError} if not draft
-   * @throws {InvoiceValidationError} if tax is invalid
-   */
   withDefaultTax(tax: TaxDetail): GeneralInvoice {
     this.assertDraft("set default tax");
     GeneralInvoice.assertValidTax(tax, "defaultTax");
-
     const items = this.lineItems.map((li) => {
-      // Determine if this line was inheriting the old default
       const wasInheriting =
         !this.defaultTax ||
         (li.tax?.taxType === this.defaultTax.taxType &&
           li.tax?.rate === this.defaultTax.rate &&
           li.tax?.jurisdiction === this.defaultTax.jurisdiction);
-
       const resolvedTax = wasInheriting ? tax : li.tax;
-
       return LineItem.create(
         {
           id: li.id,
@@ -856,26 +619,17 @@ export class GeneralInvoice {
         this.currency,
       );
     });
-
     return this.rebuild({ defaultTax: { ...tax } }, items);
   }
 
-  /**
-   * Remove the invoice-level default tax.
-   * Line items that were inheriting the default become tax-free.
-   *
-   * @throws {InvoiceMutationError} if not draft
-   */
   withoutDefaultTax(): GeneralInvoice {
     this.assertDraft("remove default tax");
-
     const items = this.lineItems.map((li) => {
       const wasInheriting =
         this.defaultTax &&
         li.tax?.taxType === this.defaultTax.taxType &&
         li.tax?.rate === this.defaultTax.rate &&
         li.tax?.jurisdiction === this.defaultTax.jurisdiction;
-
       return LineItem.create(
         {
           id: li.id,
@@ -893,40 +647,24 @@ export class GeneralInvoice {
         this.currency,
       );
     });
-
     return this.rebuild({ defaultTax: undefined }, items);
   }
 
-  /**
-   * Apply a specific tax to one line item, overriding whatever it had.
-   *
-   * @throws {InvoiceMutationError} if not draft
-   * @throws {InvoiceValidationError} if id not found or tax invalid
-   */
   withTaxOnLineItem(lineItemId: string, tax: TaxDetail): GeneralInvoice {
     this.assertDraft("set tax on line item");
     GeneralInvoice.assertValidTax(tax, `lineItem[${lineItemId}].tax`);
-
     if (!this.lineItems.some((li) => li.id === lineItemId)) {
       throw new InvoiceValidationError(
         `Line item with id "${lineItemId}" not found`,
         "lineItemId",
       );
     }
-
     return this.withUpdatedLineItem(lineItemId, { tax });
   }
 
-  /**
-   * Apply the same tax to all line items, overriding each line's existing tax.
-   *
-   * @throws {InvoiceMutationError} if not draft
-   * @throws {InvoiceValidationError} if tax is invalid
-   */
   withTaxOnAllLineItems(tax: TaxDetail): GeneralInvoice {
     this.assertDraft("set tax on all line items");
     GeneralInvoice.assertValidTax(tax, "tax");
-
     const items = this.lineItems.map((li) =>
       LineItem.create(
         {
@@ -945,39 +683,22 @@ export class GeneralInvoice {
         this.currency,
       ),
     );
-
     return this.rebuild({}, items);
   }
 
-  /**
-   * Remove tax from a specific line item.
-   * The line becomes tax-free regardless of the invoice default.
-   *
-   * @throws {InvoiceMutationError} if not draft
-   * @throws {InvoiceValidationError} if id not found
-   */
   withoutTaxOnLineItem(lineItemId: string): GeneralInvoice {
     this.assertDraft("remove tax from line item");
-
     if (!this.lineItems.some((li) => li.id === lineItemId)) {
       throw new InvoiceValidationError(
         `Line item with id "${lineItemId}" not found`,
         "lineItemId",
       );
     }
-
     return this.withUpdatedLineItem(lineItemId, { tax: undefined });
   }
 
-  /**
-   * Remove tax from all line items.
-   * Does not remove the invoice-level defaultTax definition.
-   *
-   * @throws {InvoiceMutationError} if not draft
-   */
   withoutTaxOnAllLineItems(): GeneralInvoice {
     this.assertDraft("remove tax from all line items");
-
     const items = this.lineItems.map((li) =>
       LineItem.create(
         {
@@ -996,8 +717,105 @@ export class GeneralInvoice {
         this.currency,
       ),
     );
-
     return this.rebuild({}, items);
+  }
+
+  // ── Tax inclusive / exclusive toggle ─────────────────────────────────────
+
+  /**
+   * Re-flag matching line-item taxes as **inclusive** (tax embedded in price).
+   *
+   * When a tax is inclusive the unit price is treated as tax-included:
+   *   taxAmount = lineTotal − (lineTotal / (1 + rate))
+   *   grandTotal = lineTotal  (unchanged)
+   *
+   * @param taxType - Optional filter. When provided only lines whose tax type
+   *   matches this string are affected. When omitted ALL taxed lines are toggled.
+   *
+   * Also updates `defaultTax.inclusive` when the defaultTax matches the filter
+   * (or when no filter is provided).
+   *
+   * @throws {InvoiceMutationError} if not draft
+   *
+   * @example
+   * // Make all VAT lines inclusive
+   * const updated = invoice.withInclusiveTax("VAT");
+   *
+   * // Make every taxed line inclusive
+   * const updated = invoice.withInclusiveTax();
+   */
+  withInclusiveTax(taxType?: string): GeneralInvoice {
+    this.assertDraft("set inclusive tax");
+    return this._toggleTaxInclusivity(true, taxType);
+  }
+
+  /**
+   * Re-flag matching line-item taxes as **exclusive** (tax added on top).
+   *
+   * When a tax is exclusive:
+   *   taxAmount = lineTotal × rate
+   *   grandTotal = lineTotal + taxAmount
+   *
+   * @param taxType - Optional filter. When provided only lines whose tax type
+   *   matches this string are affected. When omitted ALL taxed lines are toggled.
+   *
+   * Also updates `defaultTax.inclusive` when the defaultTax matches the filter
+   * (or when no filter is provided).
+   *
+   * @throws {InvoiceMutationError} if not draft
+   *
+   * @example
+   * // Switch VAT back to exclusive
+   * const updated = invoice.withExclusiveTax("VAT");
+   */
+  withExclusiveTax(taxType?: string): GeneralInvoice {
+    this.assertDraft("set exclusive tax");
+    return this._toggleTaxInclusivity(false, taxType);
+  }
+
+  /**
+   * Internal helper — rebuilds all line items and defaultTax with the
+   * `inclusive` flag set to `value` for lines matching `taxType` (or all lines
+   * when `taxType` is undefined).
+   */
+  private _toggleTaxInclusivity(
+    inclusive: boolean,
+    taxType?: string,
+  ): GeneralInvoice {
+    const matches = (t?: TaxDetail): boolean => {
+      if (!t) return false;
+      if (taxType === undefined) return true; // no filter → all
+      return t.taxType === taxType;
+    };
+
+    const items = this.lineItems.map((li) => {
+      if (!matches(li.tax)) return li; // unchanged — rebuild is cheap but skip if unneeded
+
+      return LineItem.create(
+        {
+          id: li.id,
+          description: li.description,
+          quantity: li.quantity,
+          unitPrice: li.unitPrice.toMajor(),
+          unit: li.unit,
+          tax: li.tax ? { ...li.tax, inclusive } : li.tax,
+          discount: li.discount,
+          accountCode: li.accountCode,
+          costCenter: li.costCenter,
+          tags: li.tags,
+          metadata: li.metadata,
+        },
+        this.currency,
+      );
+    });
+
+    // Also update the invoice-level defaultTax when it matches the filter
+    const updatedDefaultTax =
+      this.defaultTax && matches(this.defaultTax)
+        ? { ...this.defaultTax, inclusive }
+        : this.defaultTax;
+
+    return this.rebuild({ defaultTax: updatedDefaultTax }, items);
   }
 
   // ==========================================================================
@@ -1269,27 +1087,20 @@ export class GeneralInvoice {
   // ── CALCULATION & ANALYSIS ─────────────────────────────────────────────────
   // ==========================================================================
 
-  /** Whether debits === credits — required before projecting to journal. */
   isBalanced(): boolean {
     if (this.lineItems.length === 0) return false;
     const lineSum = this.lineItems.reduce((s, li) => s + li.netTotalAmount, 0);
     return Math.abs(lineSum - this.totals.grandTotalAmount) < 0.01;
   }
 
-  /** Whether a specific status transition is permitted. */
   canTransitionTo(to: InvoiceStatus): boolean {
     return ALLOWED_TRANSITIONS[this.status].includes(to);
   }
 
-  /** All statuses this invoice can legally transition to. */
   allowedTransitions(): InvoiceStatus[] {
     return [...ALLOWED_TRANSITIONS[this.status]];
   }
 
-  /**
-   * Tax total for a specific tax type across all line items.
-   * @param taxType - e.g. "VAT" | "WHT" | "GST"
-   */
   taxTotalByType(taxType: string): number {
     if (!taxType?.trim()) {
       throw new InvoiceValidationError("taxType is required", "taxType");
@@ -1299,9 +1110,6 @@ export class GeneralInvoice {
       .reduce((s, li) => s + li.taxAmountValue, 0);
   }
 
-  /**
-   * Subtotal (pre-tax, pre-discount) for a specific cost center.
-   */
   subtotalByCostCenter(costCenter: string): number {
     if (!costCenter?.trim()) {
       throw new InvoiceValidationError("costCenter is required", "costCenter");
@@ -1311,10 +1119,6 @@ export class GeneralInvoice {
       .reduce((s, li) => s + li.lineTotalAmount, 0);
   }
 
-  /**
-   * Subtotal for a specific account code.
-   * Useful for previewing journal entry distribution before projection.
-   */
   subtotalByAccountCode(accountCode: string): number {
     if (!accountCode?.trim()) {
       throw new InvoiceValidationError(
@@ -1327,31 +1131,17 @@ export class GeneralInvoice {
       .reduce((s, li) => s + li.lineTotalAmount, 0);
   }
 
-  /**
-   * Full tax breakdown grouped by (taxType + jurisdiction + inclusive).
-   *
-   * Useful for:
-   *  - BIR VAT return preparation
-   *  - Multi-jurisdiction tax separation
-   *  - Withholding tax vs output tax breakdown
-   *
-   * @returns One entry per unique tax group
-   */
   taxBreakdown(): TaxBreakdownEntry[] {
     const groups = new Map<string, TaxBreakdownEntry>();
-
     for (const li of this.lineItems) {
       if (!li.tax) continue;
-
       const key = [
         li.tax.taxType,
         li.tax.jurisdiction ?? "",
         String(li.tax.inclusive ?? false),
       ].join("::");
-
       const postDiscount = li.lineTotalAmount - li.discountAmountValue;
       const existing = groups.get(key);
-
       if (existing) {
         existing.taxableBase += postDiscount;
         existing.taxAmount += li.taxAmountValue;
@@ -1369,13 +1159,9 @@ export class GeneralInvoice {
         });
       }
     }
-
     return Array.from(groups.values());
   }
 
-  /**
-   * Full discount summary across all discounted line items.
-   */
   discountSummary(): DiscountSummary {
     const lines = this.lineItems
       .filter((li) => li.hasDiscount)
@@ -1386,7 +1172,6 @@ export class GeneralInvoice {
         discountType: li.discount!.type,
         discountValue: li.discount!.value,
       }));
-
     return {
       totalDiscount: this.totals.discountTotalAmount,
       formattedDiscount: this.totals.discountTotal.format(),
@@ -1395,21 +1180,14 @@ export class GeneralInvoice {
     };
   }
 
-  /**
-   * Line items grouped by account code.
-   * Useful for previewing how journal entry debits/credits will distribute
-   * across revenue accounts before calling toJournalEntry().
-   */
   lineItemsByAccountCode(context?: AccountingContext): LineItemsByAccount[] {
     const defaultRevenue =
       context?.accounts?.revenue ?? DEFAULT_ACCOUNTS.revenue;
     const groups = new Map<string, LineItem[]>();
-
     for (const li of this.lineItems) {
       const code = li.accountCode ?? defaultRevenue;
       groups.set(code, [...(groups.get(code) ?? []), li]);
     }
-
     return Array.from(groups.entries()).map(([accountCode, items]) => ({
       accountCode,
       lineItems: items,
@@ -1417,12 +1195,6 @@ export class GeneralInvoice {
     }));
   }
 
-  /**
-   * Outstanding amount due given an already-paid amount.
-   *
-   * @param paid - MajikMoney representing amount already paid
-   * @throws {InvoiceValidationError} if currency mismatches or paid is invalid
-   */
   amountDue(paid: MajikMoney): MajikMoney {
     if (!paid || !(paid instanceof MajikMoney)) {
       throw new InvoiceValidationError(
@@ -1430,39 +1202,25 @@ export class GeneralInvoice {
         "paid",
       );
     }
-
     if (paid.currency.code !== this.currency) {
       throw new InvoiceValidationError(
         `Currency mismatch: invoice is ${this.currency}, paid is ${paid.currency.code}`,
         "paid",
       );
     }
-
     if (paid.isNegative()) {
       throw new InvoiceValidationError(
         "paid amount cannot be negative",
         "paid",
       );
     }
-
     return this.totals.grandTotal.subtract(paid, 0);
   }
 
-  /**
-   * Whether the invoice is fully paid given an amount paid.
-   */
   isFullyPaid(paid: MajikMoney): boolean {
     return this.amountDue(paid).isZero();
   }
 
-  /**
-   * Convert all totals to a target currency using an FX rate.
-   * Returns a plain FxTotals object — does NOT modify the invoice.
-   *
-   * @param rate - Conversion rate (units of target per 1 unit of invoice currency)
-   * @param targetCurrency - ISO 4217 target currency code
-   * @throws {InvoiceValidationError} if rate or currency is invalid
-   */
   computeWithFxRate(rate: number, targetCurrency: CurrencyCode): FxTotals {
     if (typeof rate !== "number" || !isFinite(rate) || rate <= 0) {
       throw new InvoiceValidationError(
@@ -1470,22 +1228,18 @@ export class GeneralInvoice {
         "rate",
       );
     }
-
     if (!targetCurrency || !/^[A-Z]{3}$/.test(targetCurrency)) {
       throw new InvoiceValidationError(
         "targetCurrency must be a valid ISO 4217 code (e.g. USD, EUR)",
         "targetCurrency",
       );
     }
-
     if (targetCurrency === this.currency) {
       throw new InvoiceValidationError(
         "targetCurrency must differ from the invoice currency",
         "targetCurrency",
       );
     }
-
-    // MajikMoney.convert expects a CurrencyDefinition — provide a minimal one
     const targetDef = {
       code: targetCurrency,
       symbol: "",
@@ -1493,12 +1247,10 @@ export class GeneralInvoice {
       name: targetCurrency,
     };
     const convert = (m: MajikMoney) => m.convert(rate, targetDef);
-
     const subtotal = convert(this.totals.subtotal);
     const discountTotal = convert(this.totals.discountTotal);
     const taxTotal = convert(this.totals.taxTotal);
     const grandTotal = convert(this.totals.grandTotal);
-
     return {
       targetCurrency,
       rate,
@@ -1519,39 +1271,22 @@ export class GeneralInvoice {
   // ── PROJECTION METHODS ─────────────────────────────────────────────────────
   // ==========================================================================
 
-  /**
-   * Project this invoice into a double-entry JournalEntry.
-   *
-   * Sale invoice:
-   *   DR  Accounts Receivable  [grandTotal]
-   *   CR  Revenue (per acct)   [lineTotal − discount]
-   *   CR  Tax Payable          [taxTotal]  ← if tax present
-   *
-   * Credit note: entries are reversed.
-   *
-   * Always returns status: "draft" — never auto-posts.
-   *
-   * @throws {InvoiceProjectionError} if no line items or unbalanced
-   */
   toJournalEntry(context?: AccountingContext): JournalEntry {
     if (this.lineItems.length === 0) {
       throw new InvoiceProjectionError(
         "Cannot project an invoice with no line items to a journal entry",
       );
     }
-
     if (!this.isBalanced()) {
       throw new InvoiceProjectionError(
         "Cannot project an unbalanced invoice to a journal entry",
       );
     }
-
     const accounts = { ...DEFAULT_ACCOUNTS, ...context?.accounts };
     const isCredit = this.isCreditNote;
     const lines: JournalLine[] = [];
     const grandTotal = this.totals.grandTotalAmount;
 
-    // AR line
     lines.push({
       accountCode: accounts.receivable,
       accountName: "Accounts Receivable",
@@ -1560,7 +1295,6 @@ export class GeneralInvoice {
       memo: `Invoice ${this.invoiceNumber ?? this.id} — ${this.recipient.legalName}`,
     });
 
-    // Revenue lines — grouped by account code
     const revenueByAccount = new Map<
       string,
       { name: string; amount: number }
@@ -1589,7 +1323,6 @@ export class GeneralInvoice {
       });
     }
 
-    // Tax Payable line
     if (this.totals.hasTax) {
       lines.push({
         accountCode: accounts.tax,
@@ -1600,10 +1333,8 @@ export class GeneralInvoice {
       });
     }
 
-    // Balance assertion
     const totalDebits = lines.reduce((s, l) => s + (l.debit ?? 0), 0);
     const totalCredits = lines.reduce((s, l) => s + (l.credit ?? 0), 0);
-
     if (Math.abs(totalDebits - totalCredits) > 0.01) {
       throw new InvoiceProjectionError(
         `Journal entry does not balance — debits: ${totalDebits.toFixed(2)}, ` +
@@ -1630,19 +1361,12 @@ export class GeneralInvoice {
     };
   }
 
-  /**
-   * Project this invoice into an Accounts Receivable sub-ledger entry.
-   * Always returns status: "open".
-   *
-   * @throws {InvoiceProjectionError} if no line items
-   */
   toSubLedgerEntry(): SubLedgerEntry {
     if (this.lineItems.length === 0) {
       throw new InvoiceProjectionError(
         "Cannot project an invoice with no line items to a sub-ledger entry",
       );
     }
-
     return {
       id: generateUUID(),
       type: "AR",
@@ -1729,13 +1453,10 @@ export class GeneralInvoice {
         `Expected __type "GeneralInvoice", got "${json.__type}"`,
       );
     }
-
     const lineItems = json.lineItems.map((liJson) =>
       LineItem.fromJSON(liJson, json.currency),
     );
-
     const totals = InvoiceTotals.fromLineItems(lineItems, json.currency);
-
     return new GeneralInvoice(
       {
         id: json.id,
@@ -1766,11 +1487,6 @@ export class GeneralInvoice {
   // ── CANONICAL BYTES — for signing ──────────────────────────────────────────
   // ==========================================================================
 
-  /**
-   * Deterministic canonical bytes — used by MajikInvoice for hashing/signing.
-   * Keys are sorted alphabetically to ensure consistency regardless of
-   * object construction order.
-   */
   toCanonicalBytes(): Uint8Array {
     const json = this.toJSON();
     const canonical = JSON.stringify(json, Object.keys(json).sort());

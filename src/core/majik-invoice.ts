@@ -29,7 +29,7 @@
  */
 
 import { GeneralInvoice } from "./general-invoice";
-import type { GeneralInvoiceJSON } from "./general-invoice";
+import type { GeneralInvoiceJSON, ProofOfPayment } from "./general-invoice";
 import { MajikSignature } from "@majikah/majik-signature";
 import type {
   ExpectedSigner,
@@ -49,6 +49,7 @@ import {
   DecryptedCache,
   EncryptedPayload,
   IntegrityBlock,
+  MajikahInvoiceJSON,
   MajikInvoiceConstructorOptions,
   MajikInvoiceInput,
   MajikInvoiceJSON,
@@ -125,6 +126,10 @@ export class MajikInvoice {
   readonly version: string;
   readonly mode: MajikInvoiceMode;
 
+  // ── Cloud Routing & Ownership ─────────────────────────────────────────────
+  readonly userId?: string;
+  readonly accountId?: string;
+
   // ── Public summary — always plaintext ────────────────────────────────────
   readonly public: PublicInvoiceSummary;
 
@@ -134,6 +139,9 @@ export class MajikInvoice {
   // ── Integrity ─────────────────────────────────────────────────────────────
   readonly integrity: IntegrityBlock;
 
+  // ── Settlement ────────────────────────────────────────────────────────────
+  readonly proofOfPayments: readonly ProofOfPayment[];
+
   // ── Timestamps ────────────────────────────────────────────────────────────
   readonly createdAt: string;
   readonly updatedAt: string;
@@ -141,21 +149,20 @@ export class MajikInvoice {
   // ── Runtime-only decrypted cache (NOT persisted) ──────────────────────────
   private _decrypted?: DecryptedCache;
 
-  // ── Private constructor ───────────────────────────────────────────────────
-
   private constructor(opts: MajikInvoiceConstructorOptions) {
     this.version = MAJIK_INVOICE_SCHEMA_VERSION;
     this.id = opts.id;
     this.mode = opts.mode;
+    this.userId = opts.userId;
+    this.accountId = opts.accountId;
     this.public = opts.public;
     this.payload = opts.payload;
     this.integrity = opts.integrity;
+    this.proofOfPayments = Object.freeze([...(opts.proofOfPayments ?? [])]);
     this.createdAt = opts.createdAt;
     this.updatedAt = opts.updatedAt;
     this._decrypted = opts.decrypted;
   }
-
-  // ── Private rebuild ───────────────────────────────────────────────────────
 
   private rebuild(
     overrides: Partial<MajikInvoiceConstructorOptions>,
@@ -163,9 +170,12 @@ export class MajikInvoice {
     return new MajikInvoice({
       id: this.id,
       mode: this.mode,
+      userId: this.userId,
+      accountId: this.accountId,
       public: this.public,
       payload: this.payload,
       integrity: this.integrity,
+      proofOfPayments: [...this.proofOfPayments],
       createdAt: this.createdAt,
       updatedAt: new Date().toISOString(),
       decrypted: this._decrypted,
@@ -200,6 +210,8 @@ export class MajikInvoice {
       recipients,
       signerKey,
       expectedSigners,
+      userId,
+      accountId,
       ...generalInput
     } = input;
     const generalInvoice = GeneralInvoice.create(generalInput);
@@ -245,9 +257,12 @@ export class MajikInvoice {
     const instance = new MajikInvoice({
       id: generalInvoice.id,
       mode,
+      userId,
+      accountId,
       public: publicSummary,
       payload,
       integrity,
+      proofOfPayments: [],
       createdAt: now,
       updatedAt: now,
     });
@@ -261,6 +276,51 @@ export class MajikInvoice {
     }
 
     return instance;
+  }
+
+  // ==========================================================================
+  // ── METADATA & SETTLEMENT MUTATIONS ───────────────────────────────────────
+  // ==========================================================================
+
+  withUserId(userId: string): MajikInvoice {
+    if (!userId?.trim()) {
+      throw new MajikInvoiceError("userId cannot be empty.");
+    }
+    return this.rebuild({ userId: userId.trim() });
+  }
+
+  withAccountId(accountId: string): MajikInvoice {
+    if (!accountId?.trim()) {
+      throw new MajikInvoiceError("accountId cannot be empty.");
+    }
+    return this.rebuild({ accountId: accountId.trim() });
+  }
+
+  attachProofOfPayment(proof: ProofOfPayment): MajikInvoice {
+    if (!proof.id || typeof proof.amount !== "number") {
+      throw new MajikInvoiceError(
+        "ProofOfPayment must include an id and a valid amount.",
+      );
+    }
+    return this.rebuild({ proofOfPayments: [...this.proofOfPayments, proof] });
+  }
+
+  // ==========================================================================
+  // ── GETTERS ─────────────────────────────────────────────────────────────────
+  // ==========================================================================
+
+  get totalPaidAmount(): number {
+    return this.proofOfPayments.reduce((sum, proof) => sum + proof.amount, 0);
+  }
+
+  get isSettled(): boolean {
+    return this.totalPaidAmount >= this.public.totalAmount;
+  }
+
+  get paymentStatus(): "pending" | "partially-paid" | "settled" {
+    if (this.isSettled) return "settled";
+    if (this.totalPaidAmount > 0) return "partially-paid";
+    return "pending";
   }
 
   // ==========================================================================
@@ -1274,10 +1334,6 @@ export class MajikInvoice {
   // ── SERIALIZATION ──────────────────────────────────────────────────────────
   // ==========================================================================
 
-  /**
-   * Serialize to a JSON-safe object for persistence.
-   * NOTE: The decrypted cache is intentionally NOT included.
-   */
   toJSON(): MajikInvoiceJSON {
     return {
       __type: "MajikInvoice",
@@ -1287,24 +1343,81 @@ export class MajikInvoice {
       public: { ...this.public },
       payload: this.payload,
       integrity: { ...this.integrity },
+      proofOfPayments: [...this.proofOfPayments], // Fixed typo from 'this.pr'
+      userId: this.userId,
+      accountId: this.accountId,
       createdAt: this.createdAt,
       updatedAt: this.updatedAt,
     };
   }
 
   /**
-   * Rehydrate a MajikInvoice from its persisted JSON.
-   *
-   * @throws {MajikInvoiceSerializationError} if the JSON is malformed
+   * Generates a MajikahInvoiceJSON for cloud routing.
+   * Ensures ownership and routing fields are present.
    */
-  static fromJSON(json: MajikInvoiceJSON | string): MajikInvoice {
-    try {
-      const parsed: MajikInvoiceJSON =
-        typeof json === "string" ? JSON.parse(json) : json;
+  toMajikahInvoiceJSON(options?: {
+    userId?: string;
+    accountId?: string;
+    recipients?: string[];
+    publicKey?: string;
+  }): MajikahInvoiceJSON {
+    const finalUserId = options?.userId ?? this.userId;
+    if (!finalUserId?.trim()) {
+      throw new MajikInvoiceError(
+        "userId is required to generate a MajikahInvoiceJSON. Provide it during create(), via withUserId(), or as an option here.",
+      );
+    }
 
-      if (parsed.__type !== "MajikInvoice") {
+    const finalAccountId = options?.accountId ?? this.accountId ?? finalUserId;
+
+    let finalRecipients = options?.recipients;
+    if (!finalRecipients || finalRecipients.length === 0) {
+      const signers = new Set<string>();
+      if (this.integrity.signatures.length > 0) {
+        signers.add(this.integrity.signatures[0].signerId);
+      }
+      if (this.integrity.expectedSigners) {
+        this.integrity.expectedSigners.forEach((s) => signers.add(s.signerId));
+      }
+      finalRecipients = Array.from(signers);
+    }
+
+    let finalPublicKey: string = "";
+    if (this.integrity.signatures.length > 0) {
+      const firstSig = this.integrity.signatures[0];
+      // Type assertion since publicKey comes from MajikSignatureJSON
+      finalPublicKey = options?.publicKey ?? firstSig.signerEdPublicKey;
+    }
+
+    if (!finalPublicKey?.trim()) {
+      throw new MajikInvoiceError(
+        "publicKey is required to generate a MajikahInvoiceJSON.",
+      );
+    }
+
+    const baseJSON = this.toJSON();
+    return {
+      ...baseJSON,
+      __type: "MajikahInvoice",
+      user_id: finalUserId,
+      account_id: finalAccountId,
+      recipients: finalRecipients,
+      public_key: finalPublicKey,
+    } as MajikahInvoiceJSON;
+  }
+
+  static fromJSON(
+    json: MajikInvoiceJSON | MajikahInvoiceJSON | string,
+  ): MajikInvoice {
+    try {
+      const parsed = typeof json === "string" ? JSON.parse(json) : json;
+
+      if (
+        parsed.__type !== "MajikInvoice" &&
+        parsed.__type !== "MajikahInvoice"
+      ) {
         throw new MajikInvoiceSerializationError(
-          `Expected __type "MajikInvoice", got "${(parsed as any).__type}"`,
+          `Expected __type "MajikInvoice" or "MajikahInvoice", got "${parsed.__type}"`,
         );
       }
 
@@ -1314,12 +1427,20 @@ export class MajikInvoice {
         );
       }
 
+      // Map cloud fields back to standard properties if coming from MajikahInvoiceJSON
+      const parsedCloud = parsed as any;
+      const resolvedUserId = parsedCloud.user_id ?? parsed.userId;
+      const resolvedAccountId = parsedCloud.account_id ?? parsed.accountId;
+
       const instance = new MajikInvoice({
         id: parsed.id,
         mode: parsed.mode,
         public: parsed.public,
         payload: parsed.payload,
         integrity: parsed.integrity,
+        proofOfPayments: parsed.proofOfPayments ?? [],
+        userId: resolvedUserId,
+        accountId: resolvedAccountId,
         createdAt: parsed.createdAt,
         updatedAt: parsed.updatedAt,
       });
@@ -1343,7 +1464,6 @@ export class MajikInvoice {
       );
     }
   }
-
   toString(pretty = false): string {
     return JSON.stringify(this.toJSON(), null, pretty ? 2 : 0);
   }

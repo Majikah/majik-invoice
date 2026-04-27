@@ -1,6 +1,8 @@
-// ---------------------------------------------------------------------------
-// Mode
-// ---------------------------------------------------------------------------
+/**
+ * @file majik-invoice-types.ts
+ * @description MajikInvoice-specific types — mode, status, payloads, integrity,
+ * proof of payment, and the Majikah cloud envelope (MajikahInvoiceJSON).
+ */
 
 import type { MajikKey } from "@majikah/majik-key";
 import type {
@@ -10,6 +12,8 @@ import type {
   GeneralInvoiceJSON,
   InvoiceType,
   ISODateString,
+  ISODateTimeString,
+  ProofOfPayment,
 } from "./general-invoice";
 import type {
   ExpectedSigner,
@@ -17,6 +21,10 @@ import type {
   SealInfo,
 } from "@majikah/majik-signature";
 import { MajikRecipient } from "@majikah/majik-envelope";
+
+// ---------------------------------------------------------------------------
+// Mode
+// ---------------------------------------------------------------------------
 
 export type MajikInvoiceMode = "signed-only" | "encrypted-and-signed";
 
@@ -27,11 +35,11 @@ export type MajikInvoiceMode = "signed-only" | "encrypted-and-signed";
 /**
  * Runtime posture of the MajikInvoice.
  *
- * "sealed"    — sealed and signed  (encrypted or plaintext)
- * "signed"    — at least one valid signature present AND allowlist (if any) satisfied
- * "unsigned"  — invoice created but no signatures attached yet
- * "decrypted" — was encrypted; has been decrypted in this session (cached)
- * "invalid"   — structural or cryptographic verification failed
+ * "sealed"          — sealed and signed  (encrypted or plaintext)
+ * "fully-signed"    — all expected signers have signed; not yet sealed
+ * "partially-signed"— at least one signature but allowlist not fully satisfied
+ * "unsigned"        — invoice created but no signatures attached yet
+ * "invalid"         — structural or cryptographic verification failed
  */
 export type MajikInvoiceStatus =
   | "invalid"
@@ -83,7 +91,7 @@ export interface EncryptedPayload {
   algorithm: string;
   /**
    * Recipient fingerprint(s) — identifies who can decrypt.
-   * Single-recipient: one entry. Group: multiple entries (mirrors Envelope keys array).
+   * Single-recipient: one entry. Group: multiple entries.
    */
   recipientFingerprints: string[];
 }
@@ -108,7 +116,6 @@ export interface IntegrityBlock {
   /**
    * Allowlist of expected signers (optional).
    * When present, only listed signers may add signatures.
-   * Established by the first signer who calls sign() with expectedSigners.
    */
   expectedSigners?: ExpectedSigner[];
   /**
@@ -128,7 +135,7 @@ export interface IntegrityBlock {
 
 export interface DecryptedCache {
   invoice: GeneralInvoice;
-  decryptedAt: string; // ISODateTimeString
+  decryptedAt: ISODateTimeString;
   /** Fingerprint of the identity that decrypted this session */
   decryptedBy: string;
 }
@@ -153,25 +160,88 @@ export interface MajikInvoiceInput extends GeneralInvoiceInput {
   /**
    * Restrict future signers on this invoice.
    * When provided, only keys whose fingerprint appears here may sign.
-   * The signerKey is automatically added as the issuer/allowlist owner.
    */
   expectedSigners?: ExpectedSigner[];
+  /**
+   * Optional cloud user identifier — owner of this invoice.
+   * Required when calling toMajikahInvoiceJSON().
+   */
+  userId?: string;
+  /**
+   * Optional cloud organization/account identifier.
+   * Falls back to userId when calling toMajikahInvoiceJSON() if not provided.
+   */
+  accountId?: string;
 }
 
 // ---------------------------------------------------------------------------
-// JSON shape for persistence
+// JSON shape for persistence — base MajikInvoice
 // ---------------------------------------------------------------------------
 
 export interface MajikInvoiceJSON {
-  __type: "MajikInvoice";
+  __type: "MajikInvoice" | "MajikahInvoice";
   version: string;
   id: string;
   mode: MajikInvoiceMode;
   public: PublicInvoiceSummary;
   payload: MajikInvoicePayload;
   integrity: IntegrityBlock;
-  createdAt: string;
-  updatedAt: string;
+  /** Proofs of payment attached to this invoice — may be empty */
+  proofOfPayments: ProofOfPayment[];
+  /** Optional cloud user identifier */
+  userId?: string;
+  /** Optional cloud organization/account identifier */
+  accountId?: string;
+  createdAt: ISODateTimeString;
+  updatedAt: ISODateTimeString;
+}
+
+// ---------------------------------------------------------------------------
+// MajikahInvoiceJSON — extended cloud envelope
+// ---------------------------------------------------------------------------
+
+/**
+ * Extended MajikInvoice shape used when submitting to or reading from the
+ * Majikah cloud. Carries the ownership and routing fields required by the
+ * backend to associate the invoice with a user and organization, and to
+ * deliver it to the correct recipient(s).
+ *
+ * Produced by `MajikInvoice.toMajikahInvoiceJSON()`.
+ * `fromJSON()` accepts this shape and rehydrates it as a MajikInvoice.
+ *
+ * Cloud routing flow:
+ *   issuer calls toMajikahInvoiceJSON() → submits to cloud
+ *   cloud routes to recipient(s) via `recipients` array
+ *   recipient confirms → invoice stored to their local storage
+ */
+export interface MajikahInvoiceJSON extends MajikInvoiceJSON {
+  __type: "MajikahInvoice";
+  /**
+   * Cloud user ID of the invoice owner/issuer.
+   * Required — toMajikahInvoiceJSON() throws if absent.
+   */
+  user_id: string;
+  /**
+   * Cloud organization/account ID.
+   * Falls back to user_id if not explicitly provided.
+   */
+  account_id: string;
+  /**
+   * Recipient identifiers for cloud routing.
+   * Used to deliver the invoice to the correct user(s) or org(s).
+   *
+   * Defaults to:
+   *   [issuer's signer fingerprint, ...expectedSigner fingerprints]
+   * when not explicitly provided.
+   */
+  recipients: string[];
+  /**
+   * Ed25519 public key of the original invoice issuer.
+   * Taken from `MajikKeyJSON.publicKey` — base64-encoded.
+   * Derived from the first attached signature at serialization time.
+   * Allows recipients to verify the issuer's identity without a keyserver lookup.
+   */
+  public_key: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -193,7 +263,10 @@ export interface MajikInvoiceConstructorOptions {
   public: PublicInvoiceSummary;
   payload: MajikInvoicePayload;
   integrity: IntegrityBlock;
-  createdAt: string;
-  updatedAt: string;
+  proofOfPayments?: ProofOfPayment[];
+  userId?: string;
+  accountId?: string;
+  createdAt: ISODateTimeString;
+  updatedAt: ISODateTimeString;
   decrypted?: DecryptedCache;
 }
