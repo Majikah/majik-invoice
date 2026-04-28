@@ -1422,7 +1422,6 @@ export class GeneralInvoice {
 
   toJSON(): GeneralInvoiceJSON {
     return {
-      __type: "GeneralInvoice",
       version: this.version,
       id: this.id,
       invoiceNumber: this.invoiceNumber,
@@ -1448,11 +1447,6 @@ export class GeneralInvoice {
   }
 
   static fromJSON(json: GeneralInvoiceJSON): GeneralInvoice {
-    if (json.__type !== "GeneralInvoice") {
-      throw new InvoiceValidationError(
-        `Expected __type "GeneralInvoice", got "${json.__type}"`,
-      );
-    }
     const lineItems = json.lineItems.map((liJson) =>
       LineItem.fromJSON(liJson, json.currency),
     );

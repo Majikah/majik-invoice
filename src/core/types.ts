@@ -179,7 +179,6 @@ export interface MajikInvoiceInput extends GeneralInvoiceInput {
 // ---------------------------------------------------------------------------
 
 export interface MajikInvoiceJSON {
-  __type: "MajikInvoice" | "MajikahInvoice";
   version: string;
   id: string;
   mode: MajikInvoiceMode;
@@ -215,7 +214,6 @@ export interface MajikInvoiceJSON {
  *   recipient confirms → invoice stored to their local storage
  */
 export interface MajikahInvoiceJSON extends MajikInvoiceJSON {
-  __type: "MajikahInvoice";
   /**
    * Cloud user ID of the invoice owner/issuer.
    * Required — toMajikahInvoiceJSON() throws if absent.

@@ -1336,7 +1336,6 @@ export class MajikInvoice {
 
   toJSON(): MajikInvoiceJSON {
     return {
-      __type: "MajikInvoice",
       version: this.version,
       id: this.id,
       mode: this.mode,

@@ -373,7 +373,6 @@ export interface InvoiceTotalsJSON {
 }
 
 export interface GeneralInvoiceJSON {
-  __type: "GeneralInvoice";
   version: string;
   id: string;
   invoiceNumber?: string;
