@@ -284,7 +284,7 @@ const invoice = await MajikInvoice.create({
   mode: "encrypted-and-signed",
   signerKey: aliceKey,
   recipientKeys: [bobKey],
-  issuer: { legalName: "Alice Co" },
+  issuer: { legalName: "Alice Corporation" },
   recipient: { legalName: "Bob Inc" },
   currency: "PHP",
   lineItems: [

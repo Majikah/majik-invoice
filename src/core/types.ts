@@ -58,12 +58,12 @@ export type MajikInvoiceStatus =
  */
 export interface PublicInvoiceSummary {
   issuerName: string;
-  recipientName: string;
+  recipientName?: string;
   currency: CurrencyCode;
   /** Grand total in major units */
-  totalAmount: number;
+  totalAmount?: number;
   /** Formatted grand total string (e.g. "₱61,600.00") */
-  formattedTotal: string;
+  formattedTotal?: string;
   invoiceType: InvoiceType;
   issuedAt: ISODateString;
   dueDate?: ISODateString;

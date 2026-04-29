@@ -1,7 +1,5 @@
 /**
  * @file line-item.ts
- * @description Computed LineItem class — wraps LineItemInput and derives
- * lineTotal, taxAmount, discountAmount, and netTotal using MajikMoney.
  */
 
 import {
@@ -10,10 +8,8 @@ import {
   deserializeMoney,
 } from "@thezelijah/majik-money";
 import type { LineItemInput, LineItemJSON, TaxDetail, Discount } from "./types";
-
-// ---------------------------------------------------------------------------
-// Errors
-// ---------------------------------------------------------------------------
+import { TaxManager } from "./tax-manager";
+import { resolveTaxes } from "./utils";
 
 export class LineItemValidationError extends Error {
   constructor(
@@ -29,15 +25,6 @@ export class LineItemValidationError extends Error {
 // LineItem
 // ---------------------------------------------------------------------------
 
-/**
- * Computed, immutable line item.
- *
- * All money values are MajikMoney instances — never raw numbers.
- * Computed fields (lineTotal, taxAmount, discountAmount, netTotal)
- * are derived on construction and cached.
- *
- * Construct via LineItem.create() — constructor is private.
- */
 export class LineItem {
   // ── Identity ──────────────────────────────────────────────────────────────
   readonly id: string;
@@ -47,18 +34,43 @@ export class LineItem {
 
   // ── Money ─────────────────────────────────────────────────────────────────
   readonly unitPrice: MajikMoney;
-  readonly tax?: TaxDetail;
+  readonly taxes: TaxManager;
   readonly discount?: Discount;
 
-  // ── Computed ──────────────────────────────────────────────────────────────
-  /** quantity × unitPrice (before discount, before tax) */
+  // ── Computed — additive taxes (VAT, GST, excise) ──────────────────────────
   readonly lineTotal: MajikMoney;
-  /** Tax amount derived from lineTotal (or post-discount total) */
-  readonly taxAmount: MajikMoney;
-  /** Discount amount in money */
   readonly discountAmount: MajikMoney;
-  /** lineTotal − discountAmount + taxAmount (if tax is exclusive) */
+  /**
+   * Sum of all ADDITIVE tax amounts only.
+   * This is what increases (or is extracted from) the grand total.
+   */
+  readonly additiveTaxAmount: MajikMoney;
+  /**
+   * Sum of all WITHHOLDING tax amounts.
+   * Does NOT affect grandTotal — tracked separately for netPayable.
+   */
+  readonly withholdingTaxAmount: MajikMoney;
+  /**
+   * Alias kept for backward compatibility — equals additiveTaxAmount.
+   * Callers relying on taxAmount will continue to work correctly.
+   */
+  readonly taxAmount: MajikMoney;
+  /**
+   * postDiscount + additiveTaxAmount  (exclusive)
+   * postDiscount                      (fully inclusive)
+   * The invoice grand total is Σ netTotal.
+   */
   readonly netTotal: MajikMoney;
+  /**
+   * netTotal − withholdingTaxAmount
+   * The actual cash the buyer remits after withholding.
+   */
+  readonly netPayable: MajikMoney;
+
+  /** Per-taxType additive amount, keyed by taxType string */
+  readonly additiveTaxBreakdown: ReadonlyMap<string, MajikMoney>;
+  /** Per-taxType withholding amount, keyed by taxType string */
+  readonly withholdingTaxBreakdown: ReadonlyMap<string, MajikMoney>;
 
   // ── Accounting ────────────────────────────────────────────────────────────
   readonly accountCode?: string;
@@ -72,88 +84,113 @@ export class LineItem {
     input: LineItemInput,
     unitPriceMoney: MajikMoney,
     currencyCode: string,
+    defaultTaxes?: TaxManager,
   ) {
     this.id = input.id ?? crypto.randomUUID();
     this.description = input.description.trim();
     this.quantity = input.quantity;
     this.unit = input.unit;
     this.unitPrice = unitPriceMoney;
-    this.tax = input.tax;
+    const own = resolveTaxes(input);
+    this.taxes = TaxManager.resolve(own, defaultTaxes ?? TaxManager.none());
     this.discount = input.discount;
     this.accountCode = input.accountCode;
     this.costCenter = input.costCenter;
     this.tags = input.tags;
     this.metadata = input.metadata;
 
-    // ── Compute lineTotal ──────────────────────────────────────────────────
+    // ── Step 1: lineTotal ──────────────────────────────────────────────────
     this.lineTotal = unitPriceMoney.multiply(input.quantity);
 
-    // ── Compute discountAmount ─────────────────────────────────────────────
+    // ── Step 2: discountAmount ─────────────────────────────────────────────
     if (input.discount) {
-      if (input.discount.type === "percentage") {
-        this.discountAmount = this.lineTotal.applyPercentage(
-          input.discount.value,
-        );
-      } else {
-        this.discountAmount = MajikMoney.fromMajor(
-          input.discount.value,
-          currencyCode,
-        );
-      }
+      this.discountAmount =
+        input.discount.type === "percentage"
+          ? this.lineTotal.applyPercentage(input.discount.value)
+          : MajikMoney.fromMajor(input.discount.value, currencyCode);
     } else {
       this.discountAmount = MajikMoney.zero(currencyCode);
     }
 
-    // ── Post-discount base ─────────────────────────────────────────────────
+    if (this.discountAmount.greaterThan(this.lineTotal)) {
+      throw new LineItemValidationError(
+        "Discount cannot exceed line total",
+        "discount.value",
+      );
+    }
+
+    // ── Step 3: postDiscount ───────────────────────────────────────────────
+    // This contains the base price minus discounts.
+    // IMPORTANT: If inclusive taxes exist, this value STILL CONTAINS them.
     const postDiscount = this.lineTotal.subtract(this.discountAmount);
 
-    // ── Compute taxAmount ──────────────────────────────────────────────────
-    if (input.tax) {
-      if (input.tax.inclusive) {
-        // Tax is already embedded in price — extract it
-        // taxAmount = postDiscount - (postDiscount / (1 + rate))
-        const excl = postDiscount.divide(1 + input.tax.rate);
-        this.taxAmount = postDiscount.subtract(excl);
+    // ── Step 4: additive taxes (VAT / GST / excise) ────────────────────────
+    let inclusiveTaxTotal = MajikMoney.zero(currencyCode);
+    let exclusiveTaxTotal = MajikMoney.zero(currencyCode);
+
+    const additiveTaxes = this.taxes.additive;
+    const additiveMap = new Map<string, MajikMoney>();
+
+    for (const tax of additiveTaxes) {
+      if (tax.inclusive) {
+        // Extract embedded tax from the postDiscount amount
+        const amount = postDiscount.subtract(postDiscount.divide(1 + tax.rate));
+        inclusiveTaxTotal = inclusiveTaxTotal.add(amount);
+        additiveMap.set(tax.taxType, amount);
       } else {
-        // Tax is exclusive — add on top
-        this.taxAmount = postDiscount.applyPercentage(input.tax.rate);
+        // Add tax on top of the postDiscount amount
+        const amount = postDiscount.applyPercentage(tax.rate);
+        exclusiveTaxTotal = exclusiveTaxTotal.add(amount);
+        additiveMap.set(tax.taxType, amount);
       }
-    } else {
-      this.taxAmount = MajikMoney.zero(currencyCode);
     }
 
-    // ── Compute netTotal ───────────────────────────────────────────────────
-    if (input.tax?.inclusive) {
-      // Tax already in price — netTotal = postDiscount (tax is embedded)
-      this.netTotal = postDiscount;
-    } else {
-      // Tax is exclusive — add it
-      this.netTotal = postDiscount.add(this.taxAmount);
+    this.additiveTaxBreakdown = additiveMap;
+    this.additiveTaxAmount = inclusiveTaxTotal.add(exclusiveTaxTotal);
+    this.taxAmount = this.additiveTaxAmount; // backward-compat alias
+
+    // ── Step 5: netTotal (grand total contribution) ────────────────────────
+    // Since inclusive taxes are ALREADY embedded inside `postDiscount`,
+    // we only add the `exclusiveTaxTotal` on top to prevent double-counting.
+    this.netTotal = postDiscount.add(exclusiveTaxTotal);
+
+    // ── Step 6: withholding taxes (EWT / WHT) ─────────────────────────────
+    // Base = pre-VAT income payment per BIR RR 2-98.
+    // We MUST strip out the inclusive VAT from postDiscount before applying EWT.
+    // Does NOT change netTotal or grandTotal.
+    const withholdingTaxes = this.taxes.withholding;
+    const withholdingBase = postDiscount.subtract(inclusiveTaxTotal);
+
+    let withholdingTotal = MajikMoney.zero(currencyCode);
+    const withholdingMap = new Map<string, MajikMoney>();
+
+    for (const tax of withholdingTaxes) {
+      const amount = withholdingBase.applyPercentage(tax.rate);
+      withholdingTotal = withholdingTotal.add(amount);
+      withholdingMap.set(tax.taxType, amount);
     }
+
+    this.withholdingTaxBreakdown = withholdingMap;
+    this.withholdingTaxAmount = withholdingTotal;
+
+    // ── Step 7: netPayable (what buyer actually remits) ───────────────────
+    this.netPayable = this.netTotal.subtract(withholdingTotal);
   }
-
   // ── Factory ───────────────────────────────────────────────────────────────
 
-  /**
-   * Create a validated, computed LineItem.
-   *
-   * @param input - Raw line item input
-   * @param currencyCode - ISO 4217 currency code (from parent invoice)
-   * @throws {LineItemValidationError} on invalid input
-   */
-  static create(input: LineItemInput, currencyCode: string): LineItem {
+  static create(
+    input: LineItemInput,
+    currencyCode: string,
+    defaultTaxes?: TaxManager,
+  ): LineItem {
     LineItem.validate(input);
-
     const unitPriceMoney = MajikMoney.fromMajor(input.unitPrice, currencyCode);
-    return new LineItem(input, unitPriceMoney, currencyCode);
+
+    return new LineItem(input, unitPriceMoney, currencyCode, defaultTaxes);
   }
 
   // ── Validation ────────────────────────────────────────────────────────────
 
-  /**
-   * Validate raw line item input.
-   * @throws {LineItemValidationError}
-   */
   static validate(input: LineItemInput): void {
     if (!input.description || input.description.trim().length === 0) {
       throw new LineItemValidationError(
@@ -161,28 +198,24 @@ export class LineItem {
         "description",
       );
     }
-
     if (typeof input.quantity !== "number" || !isFinite(input.quantity)) {
       throw new LineItemValidationError(
         "Line item quantity must be a finite number",
         "quantity",
       );
     }
-
     if (input.quantity <= 0) {
       throw new LineItemValidationError(
         "Line item quantity must be greater than zero",
         "quantity",
       );
     }
-
     if (typeof input.unitPrice !== "number" || !isFinite(input.unitPrice)) {
       throw new LineItemValidationError(
         "Line item unitPrice must be a finite number",
         "unitPrice",
       );
     }
-
     if (input.unitPrice < 0) {
       throw new LineItemValidationError(
         "Line item unitPrice cannot be negative",
@@ -190,26 +223,7 @@ export class LineItem {
       );
     }
 
-    if (input.tax) {
-      if (typeof input.tax.rate !== "number" || !isFinite(input.tax.rate)) {
-        throw new LineItemValidationError(
-          "Tax rate must be a finite number",
-          "tax.rate",
-        );
-      }
-      if (input.tax.rate < 0 || input.tax.rate > 1) {
-        throw new LineItemValidationError(
-          "Tax rate must be between 0 and 1 (e.g. 0.12 for 12%)",
-          "tax.rate",
-        );
-      }
-      if (!input.tax.taxType || input.tax.taxType.trim().length === 0) {
-        throw new LineItemValidationError(
-          "Tax type is required when tax is specified",
-          "tax.taxType",
-        );
-      }
-    }
+    resolveTaxes(input);
 
     if (input.discount) {
       if (
@@ -229,56 +243,67 @@ export class LineItem {
       }
       if (input.discount.type === "percentage" && input.discount.value > 1) {
         throw new LineItemValidationError(
-          "Percentage discount must be between 0 and 1 (e.g. 0.10 for 10%)",
+          "Percentage discount must be between 0 and 1",
           "discount.value",
         );
       }
     }
   }
 
-  // ── Getters — convenience accessors ──────────────────────────────────────
+  // ── Getters ───────────────────────────────────────────────────────────────
 
-  /** lineTotal in major units (number) */
   get lineTotalAmount(): number {
     return this.lineTotal.toMajor();
   }
-
-  /** taxAmount in major units (number) */
   get taxAmountValue(): number {
-    return this.taxAmount.toMajor();
+    return this.additiveTaxAmount.toMajor();
   }
-
-  /** discountAmount in major units (number) */
+  get additiveTaxAmountValue(): number {
+    return this.additiveTaxAmount.toMajor();
+  }
+  get withholdingTaxAmountValue(): number {
+    return this.withholdingTaxAmount.toMajor();
+  }
   get discountAmountValue(): number {
     return this.discountAmount.toMajor();
   }
-
-  /** netTotal in major units (number) */
   get netTotalAmount(): number {
     return this.netTotal.toMajor();
   }
+  get netPayableAmount(): number {
+    return this.netPayable.toMajor();
+  }
 
-  /** Effective tax rate (0–1) — 0 if no tax */
+  get nominalTaxRate(): number {
+    const additive = this.taxes.additive;
+    return additive.reduce((s, t) => s + t.rate, 0);
+  }
+
   get effectiveTaxRate(): number {
-    return this.tax?.rate ?? 0;
+    const postDiscount = this.lineTotal.subtract(this.discountAmount);
+    return this.additiveTaxAmount.ratio(postDiscount);
   }
 
-  /** Whether this line has any tax applied */
   get isTaxable(): boolean {
-    return !!this.tax && this.tax.rate > 0;
+    return this.taxes
+      .toArray()
+      .some((t) => (t.behaviour ?? "additive") === "additive" && t.rate > 0);
   }
 
-  /** Whether this line has a discount */
   get hasDiscount(): boolean {
     return !!this.discount;
   }
 
+  taxAmountByType(taxType: string): number {
+    return this.additiveTaxBreakdown.get(taxType)?.toMajor() ?? 0;
+  }
+
+  withholdingAmountByType(taxType: string): number {
+    return this.withholdingTaxBreakdown.get(taxType)?.toMajor() ?? 0;
+  }
+
   // ── Serialization ─────────────────────────────────────────────────────────
 
-  /**
-   * Serialize to plain JSON.
-   * All MajikMoney instances are serialized via serializeMoney().
-   */
   toJSON(): LineItemJSON {
     return {
       id: this.id,
@@ -286,12 +311,15 @@ export class LineItem {
       quantity: this.quantity,
       unitPrice: serializeMoney(this.unitPrice),
       unit: this.unit,
-      tax: this.tax,
+      taxes: this.taxes.toArray(),
       discount: this.discount,
       lineTotal: serializeMoney(this.lineTotal),
-      taxAmount: serializeMoney(this.taxAmount),
+      additiveTaxAmount: serializeMoney(this.additiveTaxAmount),
+      withholdingTaxAmount: serializeMoney(this.withholdingTaxAmount),
+      taxAmount: serializeMoney(this.additiveTaxAmount), // back-compat
       discountAmount: serializeMoney(this.discountAmount),
       netTotal: serializeMoney(this.netTotal),
+      netPayable: serializeMoney(this.netPayable),
       accountCode: this.accountCode,
       costCenter: this.costCenter,
       tags: this.tags,
@@ -299,30 +327,21 @@ export class LineItem {
     };
   }
 
-  /**
-   * Rehydrate a LineItem from its JSON representation.
-   * All MajikMoneyJSON fields are deserialized back to MajikMoney instances.
-   *
-   * @param json - Serialized LineItemJSON
-   * @param currencyCode - Currency code (from parent invoice)
-   */
   static fromJSON(json: LineItemJSON, currencyCode: string): LineItem {
     const unitPriceMoney = deserializeMoney(json.unitPrice) as MajikMoney;
-
     const input: LineItemInput = {
       id: json.id,
       description: json.description,
       quantity: json.quantity,
       unitPrice: unitPriceMoney.toMajor(),
       unit: json.unit,
-      tax: json.tax,
+      taxes: json.taxes,
       discount: json.discount,
       accountCode: json.accountCode,
       costCenter: json.costCenter,
       tags: json.tags,
       metadata: json.metadata,
     };
-
     return new LineItem(input, unitPriceMoney, currencyCode);
   }
 }

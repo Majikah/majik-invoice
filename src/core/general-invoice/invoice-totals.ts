@@ -1,7 +1,5 @@
 /**
  * @file invoice-totals.ts
- * @description Computed InvoiceTotals — derived from LineItem[]
- * using MajikMoney for all arithmetic. Immutable.
  */
 
 import {
@@ -12,107 +10,105 @@ import {
 import type { InvoiceTotalsJSON, CurrencyCode } from "./types";
 import type { LineItem } from "./line-item";
 
-/**
- * Immutable invoice totals derived from line items.
- * Never constructed directly — use InvoiceTotals.fromLineItems().
- */
 export class InvoiceTotals {
-  /** Sum of all lineTotals (before discount, before tax) */
   readonly subtotal: MajikMoney;
-
-  /** Sum of all discountAmounts across line items */
   readonly discountTotal: MajikMoney;
-
-  /** Sum of all taxAmounts across line items */
+  /** Sum of additive taxes only — this is what appears on the invoice as "Tax" */
   readonly taxTotal: MajikMoney;
-
-  /**
-   * Grand total = subtotal − discountTotal + taxTotal (exclusive)
-   *             = subtotal − discountTotal (inclusive — tax already embedded)
-   * In practice this equals sum of all netTotals.
-   */
+  /** Sum of withholding taxes — tracked separately, does not reduce grandTotal */
+  readonly withholdingTotal: MajikMoney;
+  /** subtotal − discountTotal + taxTotal — the invoice-declared amount */
   readonly grandTotal: MajikMoney;
+  /** grandTotal − withholdingTotal — the cash the buyer actually remits */
+  readonly netPayable: MajikMoney;
 
   private constructor(
     subtotal: MajikMoney,
     discountTotal: MajikMoney,
     taxTotal: MajikMoney,
+    withholdingTotal: MajikMoney,
     grandTotal: MajikMoney,
+    netPayable: MajikMoney,
   ) {
     this.subtotal = subtotal;
     this.discountTotal = discountTotal;
     this.taxTotal = taxTotal;
+    this.withholdingTotal = withholdingTotal;
     this.grandTotal = grandTotal;
+    this.netPayable = netPayable;
   }
 
-  // ── Factory ───────────────────────────────────────────────────────────────
-
-  /**
-   * Compute totals from an array of LineItem instances.
-   * @param lineItems - Computed line items
-   * @param currencyCode - Invoice currency
-   */
   static fromLineItems(
     lineItems: LineItem[],
     currencyCode: CurrencyCode,
   ): InvoiceTotals {
+    const zero = MajikMoney.zero(currencyCode);
     if (lineItems.length === 0) {
-      const zero = MajikMoney.zero(currencyCode);
-      return new InvoiceTotals(zero, zero, zero, zero);
+      return new InvoiceTotals(zero, zero, zero, zero, zero, zero);
     }
 
     const subtotal = MajikMoney.sum(lineItems.map((li) => li.lineTotal));
     const discountTotal = MajikMoney.sum(
       lineItems.map((li) => li.discountAmount),
     );
-    const taxTotal = MajikMoney.sum(lineItems.map((li) => li.taxAmount));
+    const taxTotal = MajikMoney.sum(
+      lineItems.map((li) => li.additiveTaxAmount),
+    );
+    const withholdingTotal = MajikMoney.sum(
+      lineItems.map((li) => li.withholdingTaxAmount),
+    );
     const grandTotal = MajikMoney.sum(lineItems.map((li) => li.netTotal));
+    const netPayable = MajikMoney.sum(lineItems.map((li) => li.netPayable));
 
-    return new InvoiceTotals(subtotal, discountTotal, taxTotal, grandTotal);
+    return new InvoiceTotals(
+      subtotal,
+      discountTotal,
+      taxTotal,
+      withholdingTotal,
+      grandTotal,
+      netPayable,
+    );
   }
 
-  // ── Getters — convenience ─────────────────────────────────────────────────
+  // ── Getters ───────────────────────────────────────────────────────────────
 
-  /** subtotal in major units */
   get subtotalAmount(): number {
     return this.subtotal.toMajor();
   }
-
-  /** discountTotal in major units */
   get discountTotalAmount(): number {
     return this.discountTotal.toMajor();
   }
-
-  /** taxTotal in major units */
   get taxTotalAmount(): number {
     return this.taxTotal.toMajor();
   }
-
-  /** grandTotal in major units */
+  get withholdingTotalAmount(): number {
+    return this.withholdingTotal.toMajor();
+  }
   get grandTotalAmount(): number {
     return this.grandTotal.toMajor();
   }
+  get netPayableAmount(): number {
+    return this.netPayable.toMajor();
+  }
 
-  /** Effective overall discount rate (0–1). 0 if subtotal is zero. */
   get effectiveDiscountRate(): number {
     if (this.subtotal.isZero()) return 0;
     return this.discountTotal.ratio(this.subtotal);
   }
 
-  /** Effective overall tax rate relative to grand total. 0 if grand total is zero. */
   get effectiveTaxRate(): number {
     if (this.grandTotal.isZero()) return 0;
-    return this.taxTotal.ratio(this.grandTotal);
+    return this.taxTotal.ratio(this.subtotal.subtract(this.discountTotal));
   }
 
-  /** Whether any discount is applied across the invoice */
   get hasDiscount(): boolean {
     return this.discountTotal.isPositive();
   }
-
-  /** Whether any tax is applied across the invoice */
   get hasTax(): boolean {
     return this.taxTotal.isPositive();
+  }
+  get hasWithholding(): boolean {
+    return this.withholdingTotal.isPositive();
   }
 
   // ── Serialization ─────────────────────────────────────────────────────────
@@ -122,7 +118,9 @@ export class InvoiceTotals {
       subtotal: serializeMoney(this.subtotal),
       discountTotal: serializeMoney(this.discountTotal),
       taxTotal: serializeMoney(this.taxTotal),
+      withholdingTotal: serializeMoney(this.withholdingTotal),
       grandTotal: serializeMoney(this.grandTotal),
+      netPayable: serializeMoney(this.netPayable),
     };
   }
 
@@ -131,7 +129,9 @@ export class InvoiceTotals {
       deserializeMoney(json.subtotal) as MajikMoney,
       deserializeMoney(json.discountTotal) as MajikMoney,
       deserializeMoney(json.taxTotal) as MajikMoney,
+      deserializeMoney(json.withholdingTotal) as MajikMoney,
       deserializeMoney(json.grandTotal) as MajikMoney,
+      deserializeMoney(json.netPayable) as MajikMoney,
     );
   }
 }

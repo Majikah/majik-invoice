@@ -138,39 +138,6 @@ export interface Party {
 }
 
 // ---------------------------------------------------------------------------
-// Tax Detail
-// ---------------------------------------------------------------------------
-
-/**
- * Tax applied to a line item or to the invoice as a whole.
- *
- * Inclusive vs exclusive:
- *   inclusive: true  — tax is already embedded in the unit price.
- *                      The grand total stays the same; the tax amount is
- *                      extracted from the price.
- *                      taxAmount = lineTotal − (lineTotal / (1 + rate))
- *
- *   inclusive: false — tax is added on top of the unit price (default).
- *                      taxAmount = lineTotal × rate
- *                      grandTotal = lineTotal + taxAmount
- */
-export interface TaxDetail {
-  /** @example "VAT" | "GST" | "WHT" | "SALES_TAX" | "EXCISE" */
-  taxType: string;
-  /** Rate as a decimal — NOT a percentage. @example 0.12 for 12% VAT */
-  rate: number;
-  /** @example "PH" | "CA-ON" | "EU-DE" */
-  jurisdiction?: string;
-  /** @example "12% VAT" | "Withholding Tax (2%)" */
-  label?: string;
-  /**
-   * Whether this tax is price-inclusive.
-   * Defaults to false (exclusive / add-on tax).
-   */
-  inclusive?: boolean;
-}
-
-// ---------------------------------------------------------------------------
 // Discount
 // ---------------------------------------------------------------------------
 
@@ -180,24 +147,6 @@ export interface Discount {
   type: DiscountType;
   value: number;
   label?: string;
-}
-
-// ---------------------------------------------------------------------------
-// Line Item
-// ---------------------------------------------------------------------------
-
-export interface LineItemInput {
-  id?: string;
-  description: string;
-  quantity: number;
-  unitPrice: number;
-  unit?: string;
-  tax?: TaxDetail;
-  discount?: Discount;
-  accountCode?: string;
-  costCenter?: string;
-  tags?: string[];
-  metadata?: Record<string, unknown>;
 }
 
 // ---------------------------------------------------------------------------
@@ -347,31 +296,6 @@ export type PaymentStatus = "pending" | "partially_paid" | "settled";
 // Serialized shapes (JSON)
 // ---------------------------------------------------------------------------
 
-export interface LineItemJSON {
-  id: string;
-  description: string;
-  quantity: number;
-  unitPrice: Record<string, unknown>;
-  unit?: string;
-  tax?: TaxDetail;
-  discount?: Discount;
-  lineTotal: Record<string, unknown>;
-  taxAmount: Record<string, unknown>;
-  discountAmount: Record<string, unknown>;
-  netTotal: Record<string, unknown>;
-  accountCode?: string;
-  costCenter?: string;
-  tags?: string[];
-  metadata?: Record<string, unknown>;
-}
-
-export interface InvoiceTotalsJSON {
-  subtotal: Record<string, unknown>;
-  discountTotal: Record<string, unknown>;
-  taxTotal: Record<string, unknown>;
-  grandTotal: Record<string, unknown>;
-}
-
 export interface GeneralInvoiceJSON {
   version: string;
   id: string;
@@ -387,7 +311,7 @@ export interface GeneralInvoiceJSON {
   paymentTerms?: PaymentTerms;
   lineItems: LineItemJSON[];
   totals: InvoiceTotalsJSON;
-  defaultTax?: TaxDetail;
+  defaultTaxes?: TaxDetail[];
   references?: DocumentReference[];
   notes?: string;
   tags?: string[];
@@ -408,17 +332,6 @@ export interface ValidationResult {
 // ---------------------------------------------------------------------------
 // Derived / analysis output types
 // ---------------------------------------------------------------------------
-
-export interface TaxBreakdownEntry {
-  taxType: string;
-  jurisdiction?: string;
-  label?: string;
-  rate: number;
-  taxableBase: number;
-  taxAmount: number;
-  inclusive: boolean;
-  lineCount: number;
-}
 
 export interface DiscountSummary {
   totalDiscount: number;
@@ -455,7 +368,119 @@ export interface LineItemsByAccount {
 }
 
 // ---------------------------------------------------------------------------
-// Create Input
+// Internal rebuild helper type
+// ---------------------------------------------------------------------------
+
+export type InvoiceInternalState = Omit<GeneralInvoiceInput, "lineItems"> & {
+  id: string;
+  type: InvoiceType;
+  status: InvoiceStatus;
+  issueDate: ISODateString;
+  createdAt: ISODateTimeString;
+  updatedAt: ISODateTimeString;
+};
+
+// ---------------------------------------------------------------------------
+// Tax Behaviour — NEW
+// ---------------------------------------------------------------------------
+
+/**
+ * How a tax affects totals and cash settlement.
+ *
+ * "additive"
+ *   Tax is added on top of (or embedded in) the price.
+ *   Increases grandTotal (exclusive) or is extracted from it (inclusive).
+ *   Example: VAT, GST, excise duty
+ *
+ * "withholding"
+ *   Tax is withheld by the buyer at payment time.
+ *   grandTotal is UNCHANGED — the withheld amount reduces the cash remitted.
+ *   Base is always postDiscount (pre-VAT income payment) per BIR RR 2-98.
+ *   inclusive flag has NO effect on withholding taxes.
+ *   Example: EWT (CWT), WHT
+ *
+ * "informational"
+ *   Disclosed on the invoice for transparency only.
+ *   No effect on any computed total.
+ *   Example: zero-rated VAT notation, tax-exempt marker
+ */
+export type TaxBehaviour = "additive" | "withholding" | "informational";
+
+export interface TaxDetail {
+  taxType: string;
+  rate: number;
+  /** Defaults to "additive" when omitted */
+  behaviour?: TaxBehaviour;
+  jurisdiction?: string;
+  label?: string;
+  /** Only meaningful for "additive" taxes. Ignored on "withholding". */
+  inclusive?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// LineItemInput — tax → taxes (backward-compatible)
+// ---------------------------------------------------------------------------
+
+export interface LineItemInput {
+  id?: string;
+  description: string;
+  quantity: number;
+  unitPrice: number;
+  unit?: string;
+  /**
+   * Multiple taxes layered on this line item.
+   * Replaces the old singular `tax` field.
+   * Use the `tax` alias for single-tax convenience — it is coerced internally.
+   */
+  taxes?: TaxDetail[];
+
+  discount?: Discount;
+  accountCode?: string;
+  costCenter?: string;
+  tags?: string[];
+  metadata?: Record<string, unknown>;
+}
+
+// ---------------------------------------------------------------------------
+// LineItemJSON — updated
+// ---------------------------------------------------------------------------
+
+export interface LineItemJSON {
+  id: string;
+  description: string;
+  quantity: number;
+  unitPrice: Record<string, unknown>;
+  unit?: string;
+  taxes: TaxDetail[]; // was: tax?: TaxDetail
+  discount?: Discount;
+  lineTotal: Record<string, unknown>;
+  additiveTaxAmount: Record<string, unknown>; // was: taxAmount
+  withholdingTaxAmount: Record<string, unknown>; // NEW
+  taxAmount: Record<string, unknown>; // kept for back-compat — equals additiveTaxAmount
+  discountAmount: Record<string, unknown>;
+  netTotal: Record<string, unknown>;
+  netPayable: Record<string, unknown>; // NEW: netTotal − withholdingTaxAmount
+  accountCode?: string;
+  costCenter?: string;
+  tags?: string[];
+  metadata?: Record<string, unknown>;
+}
+
+// ---------------------------------------------------------------------------
+// InvoiceTotalsJSON — updated
+// ---------------------------------------------------------------------------
+
+export interface InvoiceTotalsJSON {
+  subtotal: Record<string, unknown>;
+  discountTotal: Record<string, unknown>;
+  taxTotal: Record<string, unknown>;
+  withholdingTotal: Record<string, unknown>; // NEW
+  grandTotal: Record<string, unknown>;
+  netPayable: Record<string, unknown>; // NEW
+}
+
+// ---------------------------------------------------------------------------
+// GeneralInvoiceInput — defaultTax → defaultTaxes
 // ---------------------------------------------------------------------------
 
 export interface GeneralInvoiceInput {
@@ -471,7 +496,7 @@ export interface GeneralInvoiceInput {
   period?: Period;
   paymentTerms?: PaymentTerms;
   lineItems: LineItemInput[];
-  defaultTax?: TaxDetail;
+  defaultTaxes?: TaxDetail[];
   references?: DocumentReference[];
   notes?: string;
   tags?: string[];
@@ -479,14 +504,17 @@ export interface GeneralInvoiceInput {
 }
 
 // ---------------------------------------------------------------------------
-// Internal rebuild helper type
+// TaxBreakdownEntry — updated
 // ---------------------------------------------------------------------------
 
-export type InvoiceInternalState = Omit<GeneralInvoiceInput, "lineItems"> & {
-  id: string;
-  type: InvoiceType;
-  status: InvoiceStatus;
-  issueDate: ISODateString;
-  createdAt: ISODateTimeString;
-  updatedAt: ISODateTimeString;
-};
+export interface TaxBreakdownEntry {
+  taxType: string;
+  jurisdiction?: string;
+  label?: string;
+  rate: number;
+  behaviour: TaxBehaviour;
+  taxableBase: number;
+  taxAmount: number;
+  inclusive: boolean; // always false for withholding
+  lineCount: number;
+}

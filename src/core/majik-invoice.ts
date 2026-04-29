@@ -68,6 +68,7 @@ import {
   MajikInvoiceSerializationError,
   MajikInvoiceSignatureError,
 } from "./errors";
+import { MJKI_HEADER_SIZE, MJKI_MAGIC, MJKI_VERSION } from "./binary";
 
 // ---------------------------------------------------------------------------
 // Schema version
@@ -92,7 +93,7 @@ const MAJIK_INVOICE_SCHEMA_VERSION = "1.0.0";
  * const invoice = await MajikInvoice.create({
  *   mode: "signed-only",
  *   signerKey: aliceKey,             // unlocked MajikKey
- *   issuer: { legalName: "Alice Co", tin: "123-456-789-000" },
+ *   issuer: { legalName: "Alice Corporation", tin: "123-456-789-000" },
  *   recipient: { legalName: "Bob Inc" },
  *   currency: "PHP",
  *   defaultTax: { taxType: "VAT", rate: 0.12 },
@@ -109,7 +110,7 @@ const MAJIK_INVOICE_SCHEMA_VERSION = "1.0.0";
  *   mode: "encrypted-and-signed",
  *   signerKey: aliceKey,
  *   recipientKeys: [bobKey],
- *   issuer: { legalName: "Alice Co" },
+ *   issuer: { legalName: "Alice Corporation" },
  *   recipient: { legalName: "Bob Inc" },
  *   currency: "PHP",
  *   lineItems: [{ description: "Confidential Services", quantity: 1, unitPrice: 100000 }],
@@ -313,14 +314,40 @@ export class MajikInvoice {
     return this.proofOfPayments.reduce((sum, proof) => sum + proof.amount, 0);
   }
 
-  get isSettled(): boolean {
-    return this.totalPaidAmount >= this.public.totalAmount;
+  get isSettled(): boolean | null {
+    if (this.mode === "signed-only") {
+      return this.totalPaidAmount >= this.invoice.totalAmount;
+    }
+
+    const decryptedInvoice = this._decrypted?.invoice;
+
+    if (!!decryptedInvoice) {
+      return this.totalPaidAmount >= decryptedInvoice.totalAmount;
+    }
+
+    console.warn(
+      "Invoice payload is encrypted. Call decrypt(key) first to access the full GeneralInvoice.",
+    );
+    return null;
   }
 
   get paymentStatus(): "pending" | "partially-paid" | "settled" {
     if (this.isSettled) return "settled";
     if (this.totalPaidAmount > 0) return "partially-paid";
     return "pending";
+  }
+
+  get issueDate(): Date {
+    const parsedDate: Date = new Date(this.public.issuedAt);
+    return parsedDate;
+  }
+
+  get dueDate(): Date | null {
+    if (!this.public.dueDate?.trim()) {
+      return null;
+    }
+    const parsedDate: Date = new Date(this.public.dueDate);
+    return parsedDate;
   }
 
   // ==========================================================================
@@ -421,6 +448,8 @@ export class MajikInvoice {
       updatedAt: now,
     });
 
+    this.secureLock();
+
     if (signerKey) {
       return converted.sign(signerKey);
     }
@@ -434,11 +463,11 @@ export class MajikInvoice {
   /**
    * Runtime posture of this invoice.
    *
-   * "sealed"    — sealed and signed  (encrypted or plaintext)
-   * "signed"    — at least one valid signature present AND allowlist (if any) satisfied
-   * "unsigned"  — invoice created but no signatures attached yet
-   * "decrypted" — was encrypted; has been decrypted in this session (cached)
-   * "invalid"   — structural or cryptographic verification failed
+   * "sealed"          — sealed and signed  (encrypted or plaintext)
+   * "fully-signed"    — all expected signers have signed; not yet sealed
+   * "partially-signed"— at least one signature but allowlist not fully satisfied
+   * "unsigned"        — invoice created but no signatures attached yet
+   * "invalid"         — structural or cryptographic verification failed
    */
   get status(): MajikInvoiceStatus {
     try {
@@ -1330,6 +1359,107 @@ export class MajikInvoice {
     return { valid: errors.length === 0, errors };
   }
 
+  /**
+   * Securely clears runtime-sensitive decrypted state from memory.
+   *
+   * - Only affects in-memory cache
+   * - Does NOT modify payload, signatures, or integrity
+   * - No-op for signed-only invoices
+   */
+  secureLock(): this {
+    if (this.mode === "encrypted-and-signed") {
+      this._decrypted = undefined;
+    }
+
+    return this;
+  }
+
+  // ==========================================================================
+  // ── Binary ──────────────────────────────────────────────────────────
+  // ==========================================================================
+
+  toBinary(): ArrayBuffer {
+    const json = encoder.encode(JSON.stringify(this.toJSON()));
+
+    const buffer = new Uint8Array(MJKI_HEADER_SIZE + json.length);
+    const view = new DataView(buffer.buffer);
+
+    // ── Magic ─────────────────────────────
+    buffer.set(MJKI_MAGIC, 0);
+
+    // ── Version ──────────────────────────
+    buffer[4] = MJKI_VERSION;
+
+    // ── Reserved flags (future use) ───────
+    buffer[5] = 0;
+    buffer[6] = 0;
+    buffer[7] = 0;
+
+    // ── Length ────────────────────────────
+    view.setUint32(8, json.length, false);
+
+    // ── Payload ───────────────────────────
+    buffer.set(json, MJKI_HEADER_SIZE);
+
+    return buffer.buffer;
+  }
+
+  /** Parse from binary blob. */
+  static fromBinary(blob: ArrayBuffer): MajikInvoice {
+    const bytes = new Uint8Array(blob);
+    const view = new DataView(blob);
+
+    // ── Validate minimum size ─────────────
+    if (blob.byteLength < MJKI_HEADER_SIZE) {
+      throw new MajikInvoiceSerializationError(
+        "Binary too small to be a valid MJKI file",
+      );
+    }
+
+    // ── Magic check ───────────────────────
+    for (let i = 0; i < 4; i++) {
+      if (bytes[i] !== MJKI_MAGIC[i]) {
+        throw new MajikInvoiceSerializationError(
+          "Invalid magic number: not an MJKI file",
+        );
+      }
+    }
+
+    // ── Version ───────────────────────────
+    const version = view.getUint8(4);
+    if (version !== MJKI_VERSION) {
+      throw new MajikInvoiceSerializationError(
+        `Unsupported MJKI version: ${version}`,
+      );
+    }
+
+    // ── Length ────────────────────────────
+    const length = view.getUint32(8, false);
+
+    const expectedSize = MJKI_HEADER_SIZE + length;
+
+    if (blob.byteLength < expectedSize) {
+      throw new MajikInvoiceSerializationError(
+        `Truncated MJKI payload: expected ${expectedSize}, got ${blob.byteLength}`,
+      );
+    }
+
+    // ── Extract payload ───────────────────
+    const jsonBytes = bytes.slice(MJKI_HEADER_SIZE, expectedSize);
+
+    let parsed: MajikInvoiceJSON;
+
+    try {
+      parsed = JSON.parse(decoder.decode(jsonBytes));
+    } catch {
+      throw new MajikInvoiceSerializationError(
+        "Failed to decode MJKI JSON payload",
+      );
+    }
+
+    return MajikInvoice.fromJSON(parsed);
+  }
+
   // ==========================================================================
   // ── SERIALIZATION ──────────────────────────────────────────────────────────
   // ==========================================================================
@@ -1397,12 +1527,11 @@ export class MajikInvoice {
     const baseJSON = this.toJSON();
     return {
       ...baseJSON,
-      __type: "MajikahInvoice",
       user_id: finalUserId,
       account_id: finalAccountId,
       recipients: finalRecipients,
       public_key: finalPublicKey,
-    } as MajikahInvoiceJSON;
+    };
   }
 
   static fromJSON(
@@ -1653,3 +1782,6 @@ export class MajikInvoice {
     }
   }
 }
+
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
