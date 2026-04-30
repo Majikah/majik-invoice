@@ -1540,14 +1540,6 @@ export class MajikInvoice {
     try {
       const parsed = typeof json === "string" ? JSON.parse(json) : json;
 
-      if (
-        parsed.__type !== "MajikInvoice" &&
-        parsed.__type !== "MajikahInvoice"
-      ) {
-        throw new MajikInvoiceSerializationError(
-          `Expected __type "MajikInvoice" or "MajikahInvoice", got "${parsed.__type}"`,
-        );
-      }
 
       if (!parsed.id || !parsed.mode || !parsed.payload || !parsed.integrity) {
         throw new MajikInvoiceSerializationError(
