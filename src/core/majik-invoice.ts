@@ -29,7 +29,11 @@
  */
 
 import { GeneralInvoice } from "./general-invoice";
-import type { GeneralInvoiceJSON, ProofOfPayment } from "./general-invoice";
+import type {
+  GeneralInvoiceJSON,
+  PaymentStatus,
+  ProofOfPayment,
+} from "./general-invoice";
 import { MajikSignature } from "@majikah/majik-signature";
 import type {
   ExpectedSigner,
@@ -69,6 +73,7 @@ import {
   MajikInvoiceSignatureError,
 } from "./errors";
 import { MJKI_HEADER_SIZE, MJKI_MAGIC, MJKI_VERSION } from "./binary";
+import { MajikMoney } from "@thezelijah/majik-money";
 
 // ---------------------------------------------------------------------------
 // Schema version
@@ -140,9 +145,6 @@ export class MajikInvoice {
   // ── Integrity ─────────────────────────────────────────────────────────────
   readonly integrity: IntegrityBlock;
 
-  // ── Settlement ────────────────────────────────────────────────────────────
-  readonly proofOfPayments: readonly ProofOfPayment[];
-
   // ── Timestamps ────────────────────────────────────────────────────────────
   readonly createdAt: string;
   readonly updatedAt: string;
@@ -159,7 +161,6 @@ export class MajikInvoice {
     this.public = opts.public;
     this.payload = opts.payload;
     this.integrity = opts.integrity;
-    this.proofOfPayments = Object.freeze([...(opts.proofOfPayments ?? [])]);
     this.createdAt = opts.createdAt;
     this.updatedAt = opts.updatedAt;
     this._decrypted = opts.decrypted;
@@ -176,7 +177,6 @@ export class MajikInvoice {
       public: this.public,
       payload: this.payload,
       integrity: this.integrity,
-      proofOfPayments: [...this.proofOfPayments],
       createdAt: this.createdAt,
       updatedAt: new Date().toISOString(),
       decrypted: this._decrypted,
@@ -263,7 +263,6 @@ export class MajikInvoice {
       public: publicSummary,
       payload,
       integrity,
-      proofOfPayments: [],
       createdAt: now,
       updatedAt: now,
     });
@@ -297,44 +296,88 @@ export class MajikInvoice {
     return this.rebuild({ accountId: accountId.trim() });
   }
 
-  attachProofOfPayment(proof: ProofOfPayment): MajikInvoice {
-    if (!proof.id || typeof proof.amount !== "number") {
-      throw new MajikInvoiceError(
-        "ProofOfPayment must include an id and a valid amount.",
-      );
-    }
-    return this.rebuild({ proofOfPayments: [...this.proofOfPayments, proof] });
+  addPayment(proof: ProofOfPayment): MajikInvoice {
+    const invoice = this._requirePlaintextInvoice("addPayment");
+
+    const updated = invoice.addPayment(proof);
+
+    return this._reissueFromMutation(updated);
+  }
+
+  removePayment(paymentId: string): MajikInvoice {
+    const invoice = this._requirePlaintextInvoice("removePayment");
+
+    const updated = invoice.removePayment(paymentId);
+
+    return this._reissueFromMutation(updated);
+  }
+
+  clearPayments(): MajikInvoice {
+    const invoice = this._requirePlaintextInvoice("clearPayments");
+
+    const updated = invoice.clearPayments();
+
+    return this._reissueFromMutation(updated);
   }
 
   // ==========================================================================
   // ── GETTERS ─────────────────────────────────────────────────────────────────
   // ==========================================================================
 
-  get totalPaidAmount(): number {
-    return this.proofOfPayments.reduce((sum, proof) => sum + proof.amount, 0);
-  }
-
-  get isSettled(): boolean | null {
-    if (this.mode === "signed-only") {
-      return this.totalPaidAmount >= this.invoice.totalAmount;
+  get totalPaid(): MajikMoney | null {
+    if (this.mode === "encrypted-and-signed") {
+      const decryptedInvoice = this._decrypted?.invoice;
+      if (!decryptedInvoice) {
+        console.warn(
+          "Invoice payload is encrypted. Call decrypt(key) first to access the full GeneralInvoice.",
+        );
+        return null;
+      }
     }
 
-    const decryptedInvoice = this._decrypted?.invoice;
-
-    if (!!decryptedInvoice) {
-      return this.totalPaidAmount >= decryptedInvoice.totalAmount;
-    }
-
-    console.warn(
-      "Invoice payload is encrypted. Call decrypt(key) first to access the full GeneralInvoice.",
-    );
-    return null;
+    return this.invoice.totalPaid;
   }
 
-  get paymentStatus(): "pending" | "partially-paid" | "settled" {
-    if (this.isSettled) return "settled";
-    if (this.totalPaidAmount > 0) return "partially-paid";
-    return "pending";
+  get isFullyPaid(): boolean | null {
+    if (this.mode === "encrypted-and-signed") {
+      const decryptedInvoice = this._decrypted?.invoice;
+      if (!decryptedInvoice) {
+        console.warn(
+          "Invoice payload is encrypted. Call decrypt(key) first to access the full GeneralInvoice.",
+        );
+        return null;
+      }
+    }
+
+    return this.invoice.isFullyPaid;
+  }
+
+  get paymentStatus(): PaymentStatus | null {
+    if (this.mode === "encrypted-and-signed") {
+      const decryptedInvoice = this._decrypted?.invoice;
+      if (!decryptedInvoice) {
+        console.warn(
+          "Invoice payload is encrypted. Call decrypt(key) first to access the full GeneralInvoice.",
+        );
+        return null;
+      }
+    }
+
+    return this.invoice.paymentStatus;
+  }
+
+  get payments(): ProofOfPayment[] | null {
+    if (this.mode === "encrypted-and-signed") {
+      const decryptedInvoice = this._decrypted?.invoice;
+      if (!decryptedInvoice) {
+        console.warn(
+          "Invoice payload is encrypted. Call decrypt(key) first to access the full GeneralInvoice.",
+        );
+        return null;
+      }
+    }
+
+    return [...this.invoice.proofOfPayments];
   }
 
   get issueDate(): Date {
@@ -515,6 +558,12 @@ export class MajikInvoice {
 
   get isEncrypted(): boolean {
     return this.mode === "encrypted-and-signed";
+  }
+
+  get isLocked(): boolean {
+    if (this.mode !== "encrypted-and-signed") return false;
+
+    return !this.decryptedInvoice || !this.decryptedCache;
   }
 
   get isSigned(): boolean {
@@ -1472,7 +1521,7 @@ export class MajikInvoice {
       public: { ...this.public },
       payload: this.payload,
       integrity: { ...this.integrity },
-      proofOfPayments: [...this.proofOfPayments], // Fixed typo from 'this.pr'
+
       userId: this.userId,
       accountId: this.accountId,
       createdAt: this.createdAt,
@@ -1540,7 +1589,6 @@ export class MajikInvoice {
     try {
       const parsed = typeof json === "string" ? JSON.parse(json) : json;
 
-
       if (!parsed.id || !parsed.mode || !parsed.payload || !parsed.integrity) {
         throw new MajikInvoiceSerializationError(
           "MajikInvoiceJSON is missing required fields (id, mode, payload, integrity)",
@@ -1558,7 +1606,6 @@ export class MajikInvoice {
         public: parsed.public,
         payload: parsed.payload,
         integrity: parsed.integrity,
-        proofOfPayments: parsed.proofOfPayments ?? [],
         userId: resolvedUserId,
         accountId: resolvedAccountId,
         createdAt: parsed.createdAt,
@@ -1592,6 +1639,47 @@ export class MajikInvoice {
   // ── PRIVATE HELPERS ────────────────────────────────────────────────────────
   // ==========================================================================
 
+  private _reissueFromMutation(updatedInvoice: GeneralInvoice): MajikInvoice {
+    // NOTE:
+    // - drops signatures (correct)
+    // - preserves mode
+    // - DOES NOT auto-sign (caller decides)
+
+    const publicSummary = MajikInvoice._buildPublicSummary(updatedInvoice);
+    const canonicalBytes = updatedInvoice.toCanonicalBytes();
+    const contentHash = MajikInvoice._sha256Hex(canonicalBytes);
+
+    let payload: MajikInvoicePayload;
+
+    if (this.mode === "encrypted-and-signed") {
+      throw new MajikInvoiceError(
+        "Cannot mutate encrypted invoice without re-encryption context. Use reissue() with recipients.",
+      );
+    }
+
+    payload = {
+      kind: "signed-only",
+      invoice: updatedInvoice.toJSON(),
+    };
+
+    const integrity: IntegrityBlock = {
+      contentHash,
+      hashAlgorithm: "SHA-256",
+      signatures: [],
+      isSealed: false,
+    };
+
+    return new MajikInvoice({
+      id: updatedInvoice.id,
+      mode: this.mode,
+      public: publicSummary,
+      payload,
+      integrity,
+      createdAt: this.createdAt,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
   /**
    * Build the public summary from a GeneralInvoice.
    */
@@ -1608,6 +1696,8 @@ export class MajikInvoice {
       issuedAt: invoice.issueDate,
       dueDate: invoice.dueDate,
       invoiceNumber: invoice.invoiceNumber,
+      paymentStatus: invoice.paymentStatus,
+      status: invoice.status,
     };
   }
 

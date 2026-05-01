@@ -10,9 +10,11 @@ import type {
   GeneralInvoice,
   GeneralInvoiceInput,
   GeneralInvoiceJSON,
+  InvoiceStatus,
   InvoiceType,
   ISODateString,
   ISODateTimeString,
+  PaymentStatus,
   ProofOfPayment,
 } from "./general-invoice";
 import type {
@@ -68,6 +70,8 @@ export interface PublicInvoiceSummary {
   issuedAt: ISODateString;
   dueDate?: ISODateString;
   invoiceNumber?: string;
+  status: InvoiceStatus;
+  paymentStatus: PaymentStatus
 }
 
 // ---------------------------------------------------------------------------
@@ -185,8 +189,6 @@ export interface MajikInvoiceJSON {
   public: PublicInvoiceSummary;
   payload: MajikInvoicePayload;
   integrity: IntegrityBlock;
-  /** Proofs of payment attached to this invoice — may be empty */
-  proofOfPayments: ProofOfPayment[];
   /** Optional cloud user identifier */
   userId?: string;
   /** Optional cloud organization/account identifier */
@@ -261,7 +263,6 @@ export interface MajikInvoiceConstructorOptions {
   public: PublicInvoiceSummary;
   payload: MajikInvoicePayload;
   integrity: IntegrityBlock;
-  proofOfPayments?: ProofOfPayment[];
   userId?: string;
   accountId?: string;
   createdAt: ISODateTimeString;

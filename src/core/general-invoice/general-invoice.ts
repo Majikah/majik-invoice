@@ -34,6 +34,8 @@ import type {
   DiscountSummary,
   FxTotals,
   InvoiceInternalState,
+  ProofOfPayment,
+  PaymentStatus,
 } from "./types";
 import { generateUUID } from "./utils";
 import {
@@ -74,6 +76,9 @@ export class GeneralInvoice {
   /** Invoice-level default taxes — applied to any line item with no own taxes */
   readonly defaultTaxes: TaxManager;
 
+  // ── Settlement ────────────────────────────────────────────────────────────
+  readonly proofOfPayments: readonly ProofOfPayment[];
+
   // ── Supplementary ─────────────────────────────────────────────────────────
   readonly references?: readonly DocumentReference[];
   readonly notes?: string;
@@ -90,6 +95,7 @@ export class GeneralInvoice {
     input: InvoiceInternalState,
     lineItems: LineItem[],
     totals: InvoiceTotals,
+    payment: ProofOfPayment[] = [],
   ) {
     this.version = SCHEMA_VERSION;
     this.id = input.id;
@@ -105,6 +111,9 @@ export class GeneralInvoice {
     this.paymentTerms = input.paymentTerms;
     this.lineItems = Object.freeze(lineItems);
     this.totals = totals;
+
+    this.proofOfPayments = Object.freeze([...(payment ?? [])]);
+
     // Always store as TaxManager — coerce whatever came in
     this.defaultTaxes = TaxManager.coerce(input.defaultTaxes);
     this.references = input.references
@@ -351,6 +360,55 @@ export class GeneralInvoice {
   withoutMetadata(): GeneralInvoice {
     this.assertEditable("clear metadata");
     return this.rebuild({ metadata: undefined });
+  }
+
+  // ─────────────────────────────────────────────
+  // ── STATUS UPDATE ─────────────────────────────
+  // ─────────────────────────────────────────────
+
+  issue(): GeneralInvoice {
+    return this.withStatus("issued");
+  }
+
+  send(): GeneralInvoice {
+    return this.withStatus("sent");
+  }
+
+  view(): GeneralInvoice {
+    return this.withStatus("viewed");
+  }
+
+  markAsPaid(): GeneralInvoice {
+    return this.withStatus("paid");
+  }
+
+  markAsPartiallyPaid(): GeneralInvoice {
+    return this.withStatus("partial");
+  }
+
+  markAsOverdue(force = false): GeneralInvoice {
+    if (!force && !this.isOverdue) {
+      throw new InvoiceLifecycleError(
+        "Cannot mark as overdue before due date has passed",
+        this.status,
+        "overdue",
+      );
+    }
+
+    // NOTE: may still fail if transition isn't allowed
+    return this.withStatus("overdue");
+  }
+
+  dispute(): GeneralInvoice {
+    return this.withStatus("disputed");
+  }
+
+  resolveDispute(): GeneralInvoice {
+    return this.withStatus("issued");
+  }
+
+  voidInvoice(): GeneralInvoice {
+    return this.withStatus("void");
   }
 
   // ── Dates & terms (unchanged) ─────────────────────────────────────────────
@@ -977,6 +1035,121 @@ export class GeneralInvoice {
   }
 
   // ==========================================================================
+  // ── PAYMENT AND SETTLEMENT METHODS ─────────────────────────────────────────────────────
+  // ==========================================================================
+
+  get paymentStatus(): PaymentStatus {
+    if (this.isFullyPaid) return "settled";
+    if (this.totalPaid.isPositive()) return "partially_paid";
+    return "pending";
+  }
+
+  get totalPaid(): MajikMoney {
+    return this.proofOfPayments.reduce(
+      (sum, p) => sum.add(MajikMoney.fromMajor(p.amount, this.currency)),
+      MajikMoney.zero(this.currency),
+    );
+  }
+
+  get amountDue(): MajikMoney {
+    return this.totals.grandTotal.subtract(this.totalPaid);
+  }
+
+  get isFullyPaid(): boolean {
+    return this.amountDue.isZero();
+  }
+
+  addPayment(proof: ProofOfPayment): GeneralInvoice {
+    this.assertEditable("add payment");
+
+    if (!proof.id) {
+      throw new InvoiceValidationError("Proof must have an id", "proof.id");
+    }
+
+    return this._setPayments([...this.proofOfPayments, proof]);
+  }
+
+  removePayment(paymentId: string): GeneralInvoice {
+    this.assertEditable("remove payment");
+
+    if (!paymentId || paymentId.trim().length === 0) {
+      throw new InvoiceValidationError("paymentId is required", "paymentId");
+    }
+
+    if (!this.proofOfPayments.some((p) => p.id === paymentId)) {
+      throw new InvoiceValidationError(
+        `Payment with id "${paymentId}" not found`,
+        "paymentId",
+      );
+    }
+
+    const remaining = this.proofOfPayments.filter((p) => p.id !== paymentId);
+
+    return this._setPayments(remaining);
+  }
+
+  clearPayments(): GeneralInvoice {
+    this.assertEditable("clear payments");
+    return this._setPayments([]);
+  }
+
+  private _setPayments(payments: ProofOfPayment[]): GeneralInvoice {
+    // ── Normalize / sort ───────────────────────
+    const sorted = [...payments].sort((a, b) =>
+      a.settledAt.localeCompare(b.settledAt),
+    );
+
+    // ── Validate duplicates ────────────────────
+    const ids = new Set<string>();
+    for (const p of sorted) {
+      if (ids.has(p.id)) {
+        throw new InvoiceValidationError("Duplicate proof id", "proof.id");
+      }
+      ids.add(p.id);
+
+      if (p.amount <= 0) {
+        throw new InvoiceValidationError(
+          "Payment must be greater than 0",
+          "proof.amount",
+        );
+      }
+
+      if (p.currency !== this.currency) {
+        throw new InvoiceValidationError(
+          `Payment currency (${p.currency}) must match invoice currency (${this.currency})`,
+          "proof.currency",
+        );
+      }
+    }
+
+    // ── Rebuild ────────────────────────────────
+    const updated = this.rebuild({
+      proofOfPayments: sorted,
+    });
+
+    const paid = updated.totalPaid;
+    const total = updated.totals.grandTotal;
+    const due = updated.amountDue;
+
+    // ── Prevent overpayment ────────────────────
+    if (paid.greaterThan(total)) {
+      throw new InvoiceValidationError("Overpayment not allowed");
+    }
+
+    // ── Resolve status ─────────────────────────
+    if (due.isZero()) {
+      return updated.withStatus("paid");
+    }
+
+    if (paid.greaterThan(MajikMoney.zero(this.currency))) {
+      return updated.withStatus("partial");
+    }
+
+    // fallback: unpaid state
+    return updated;
+  }
+
+  // ==========================================================================
   // ── CALCULATION & ANALYSIS ─────────────────────────────────────────────────
   // ==========================================================================
 
@@ -1130,32 +1303,6 @@ export class GeneralInvoice {
       lineItems: items,
       subtotal: items.reduce((s, li) => s + li.lineTotalAmount, 0),
     }));
-  }
-
-  amountDue(paid: MajikMoney): MajikMoney {
-    if (!paid || !(paid instanceof MajikMoney)) {
-      throw new InvoiceValidationError(
-        "paid must be a MajikMoney instance",
-        "paid",
-      );
-    }
-    if (paid.currency.code !== this.currency) {
-      throw new InvoiceValidationError(
-        `Currency mismatch: invoice is ${this.currency}, paid is ${paid.currency.code}`,
-        "paid",
-      );
-    }
-    if (paid.isNegative()) {
-      throw new InvoiceValidationError(
-        "paid amount cannot be negative",
-        "paid",
-      );
-    }
-    return this.totals.grandTotal.subtract(paid, 0);
-  }
-
-  isFullyPaid(paid: MajikMoney): boolean {
-    return this.amountDue(paid).isZero();
   }
 
   computeWithFxRate(rate: number, targetCurrency: CurrencyCode): FxTotals {
@@ -1385,6 +1532,7 @@ export class GeneralInvoice {
       paymentTerms: this.paymentTerms,
       lineItems: this.lineItems.map((li) => li.toJSON()),
       totals: this.totals.toJSON(),
+      proofOfPayments: [...this.proofOfPayments],
       defaultTaxes: this.defaultTaxes.toArray(),
       references: this.references ? [...this.references] : undefined,
       notes: this.notes,

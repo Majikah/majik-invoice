@@ -311,6 +311,7 @@ export interface GeneralInvoiceJSON {
   paymentTerms?: PaymentTerms;
   lineItems: LineItemJSON[];
   totals: InvoiceTotalsJSON;
+  proofOfPayments: ProofOfPayment[];
   defaultTaxes?: TaxDetail[];
   references?: DocumentReference[];
   notes?: string;
@@ -496,6 +497,7 @@ export interface GeneralInvoiceInput {
   period?: Period;
   paymentTerms?: PaymentTerms;
   lineItems: LineItemInput[];
+  proofOfPayments?: ProofOfPayment[];
   defaultTaxes?: TaxDetail[];
   references?: DocumentReference[];
   notes?: string;
