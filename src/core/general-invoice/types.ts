@@ -245,8 +245,7 @@ export interface SubLedgerEntry {
  */
 export type PaymentMethod =
   | "bank_transfer"
-  | "gcash"
-  | "maya"
+  | "ewallet"
   | "cash"
   | "check"
   | "credit_card"

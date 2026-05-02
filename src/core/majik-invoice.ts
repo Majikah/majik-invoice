@@ -50,6 +50,7 @@ import type { MajikKey } from "@majikah/majik-key";
 
 import { hash } from "@stablelib/sha256";
 import {
+  DashboardStats,
   DecryptedCache,
   EncryptedPayload,
   IntegrityBlock,
@@ -74,6 +75,27 @@ import {
 } from "./errors";
 import { MJKI_HEADER_SIZE, MJKI_MAGIC, MJKI_VERSION } from "./binary";
 import { MajikMoney } from "@thezelijah/majik-money";
+
+// ── Batch / stats types ───────────────────────────────────────────────────
+
+export interface BatchDecryptResult {
+  success: boolean;
+  decrypted: MajikInvoice[];
+  errors: Array<{ invoiceId: string; reason: string }>;
+}
+
+export interface BatchLockResult {
+  locked: number;
+  skipped: number; // signed-only invoices
+}
+
+export interface OverdueMarkResult {
+  marked: MajikInvoice[]; // updated invoice instances
+  skipped: Array<{
+    invoiceId: string;
+    reason: "encrypted" | "not-overdue" | "wrong-status";
+  }>;
+}
 
 // ---------------------------------------------------------------------------
 // Schema version
@@ -556,12 +578,26 @@ export class MajikInvoice {
     return "Unknown";
   }
 
+  /**
+   *Returns `true` if the mode is `encrypted-and-signed`
+   */
   get isEncrypted(): boolean {
     return this.mode === "encrypted-and-signed";
   }
 
+  /**
+   *Returns `true` if the mode is `signed-only`
+   */
+  get isSignedOnly(): boolean {
+    return this.mode === "signed-only";
+  }
+
+  /**
+   * Returns `true` if the invoice is encrypted-and-signed and currently not unlocked or decrypted.
+   * Defaults to `false` if the invoice is signed-only
+   */
   get isLocked(): boolean {
-    if (this.mode !== "encrypted-and-signed") return false;
+    if (this.isSignedOnly) return false;
 
     return !this.decryptedInvoice || !this.decryptedCache;
   }
@@ -1424,6 +1460,435 @@ export class MajikInvoice {
   }
 
   // ==========================================================================
+  // ── Batch Operations ──────────────────────────────────────────────────────────
+  // ==========================================================================
+
+  /**
+   * Decrypt an array of MajikInvoice instances concurrently.
+   * Signed-only invoices are passed through unchanged (they need no decryption).
+   * Encrypted invoices that cannot be decrypted with the provided key are
+   * collected in the errors array and excluded from `decrypted`.
+   *
+   * @param invoices  - Array of MajikInvoice to process
+   * @param key       - An unlocked MajikKey authorised to decrypt the invoices
+   * @returns BatchDecryptResult
+   */
+  static async batchDecrypt(
+    invoices: MajikInvoice[],
+    key: MajikKey,
+  ): Promise<BatchDecryptResult> {
+    const errors: BatchDecryptResult["errors"] = [];
+
+    const results = await Promise.allSettled(
+      invoices.map(async (inv) => {
+        // Signed-only: nothing to decrypt, pass through
+        if (inv.mode === "signed-only") return inv;
+
+        // Already decrypted this session — skip redundant work
+        if (inv.hasDecryptedCache) return inv;
+
+        // Authorisation pre-check — avoids expensive crypto on wrong key
+        if (!inv.canDecrypt(key)) {
+          throw new Error(
+            `Key "${key.fingerprint}" is not a recipient of this invoice.`,
+          );
+        }
+
+        // Decrypt — caches result on the instance
+        await inv.decrypt(key);
+        return inv;
+      }),
+    );
+
+    const decrypted: MajikInvoice[] = [];
+
+    results.forEach((result, i) => {
+      if (result.status === "fulfilled") {
+        decrypted.push(result.value);
+      } else {
+        errors.push({
+          invoiceId: invoices[i].id,
+          reason:
+            result.reason instanceof Error
+              ? result.reason.message
+              : String(result.reason),
+        });
+      }
+    });
+
+    return {
+      success: errors.length === 0,
+      decrypted,
+      errors,
+    };
+  }
+
+  /**
+   * Clears the in-memory decrypted cache from all encrypted invoices.
+   * Signed-only invoices are skipped (nothing to lock).
+   *
+   * Call this after you're done with a batch to minimise plaintext in memory.
+   *
+   * @param invoices - Array of MajikInvoice to lock
+   * @returns BatchLockResult with counts of locked vs skipped
+   */
+  static batchLock(invoices: MajikInvoice[]): BatchLockResult {
+    let locked = 0;
+    let skipped = 0;
+
+    for (const inv of invoices) {
+      if (inv.mode === "signed-only") {
+        skipped++;
+        continue;
+      }
+      inv.secureLock();
+      locked++;
+    }
+
+    return { locked, skipped };
+  }
+
+  /**
+   * Scans an array of MajikInvoice and marks any whose due date has passed
+   * and whose current status allows an "overdue" transition.
+   *
+   * For each candidate:
+   *   - If signed-only, or already decrypted: process directly.
+   *   - If encrypted and decryptKey is provided: attempt decrypt first.
+   *   - If encrypted and no decryptKey: skip (or throw if strict=true).
+   *
+   * Returns an OverdueMarkResult. The `marked` array contains NEW GeneralInvoice
+   * instances from .markAsOverdue() — callers are responsible for reissuing
+   * the MajikInvoice and persisting.
+   *
+   * @param invoices    - Invoices to check
+   * @param options.strict     - Throw on encrypted+inaccessible instead of skipping (default: false)
+   * @param options.decryptKey - Optional key; used to decrypt encrypted invoices before checking
+   */
+  static async autoMarkOverdue(
+    invoices: MajikInvoice[],
+    options: {
+      strict?: boolean;
+      decryptKey?: MajikKey;
+    } = {},
+  ): Promise<OverdueMarkResult> {
+    const { strict = false, decryptKey } = options;
+    const today = new Date().toISOString().slice(0, 10);
+
+    const marked: MajikInvoice[] = [];
+    const skipped: OverdueMarkResult["skipped"] = [];
+
+    for (const inv of invoices) {
+      // ── 1. Resolve the GeneralInvoice ─────────────────────────────────────
+      let gi: GeneralInvoice;
+
+      if (inv.mode === "signed-only") {
+        gi = inv.invoice;
+      } else if (inv.hasDecryptedCache) {
+        gi = inv.invoice;
+      } else if (decryptKey) {
+        // Attempt decrypt — skip if this key isn't authorised
+        if (!inv.canDecrypt(decryptKey)) {
+          if (strict) {
+            throw new MajikInvoiceKeyError(
+              `batchAutoMarkOverdue (strict): Key is not a recipient of invoice "${inv.id}".`,
+            );
+          }
+          skipped.push({ invoiceId: inv.id, reason: "encrypted" });
+          continue;
+        }
+        try {
+          await inv.decrypt(decryptKey);
+          gi = inv.invoice;
+        } catch (error) {
+          if (strict) throw error;
+          skipped.push({ invoiceId: inv.id, reason: "encrypted" });
+          continue;
+        }
+      } else {
+        // Encrypted, no key provided
+        if (strict) {
+          throw new MajikInvoiceError(
+            `batchAutoMarkOverdue (strict): Invoice "${inv.id}" is encrypted and no decryptKey was provided.`,
+          );
+        }
+        skipped.push({ invoiceId: inv.id, reason: "encrypted" });
+        continue;
+      }
+
+      // ── 2. Due-date check ─────────────────────────────────────────────────
+      if (!gi.dueDate || gi.dueDate >= today) {
+        skipped.push({ invoiceId: inv.id, reason: "not-overdue" });
+        continue;
+      }
+
+      // ── 3. Transition guard ────────────────────────────────────────────────
+      if (!gi.canTransitionTo("overdue")) {
+        skipped.push({ invoiceId: inv.id, reason: "wrong-status" });
+        continue;
+      }
+
+      // ── 4. Mark overdue — force=true because we already checked the date ──
+      const updatedGi = gi.markAsOverdue(true);
+
+      // Reissue the MajikInvoice shell with updated GeneralInvoice
+      // (drops signatures — caller must re-sign)
+      const updatedMajik = inv._reissueFromMutation(updatedGi);
+      marked.push(updatedMajik);
+    }
+
+    return { marked, skipped };
+  }
+
+  // ==========================================================================
+  // ── Dashboard Stats ──────────────────────────────────────────────────────────
+  // ==========================================================================
+
+  /**
+   * Compute dashboard statistics across an array of MajikInvoice.
+   * Encrypted invoices that haven't been decrypted are counted in totals
+   * using their public summary only — detailed financials (tax, discount, etc.)
+   * require the decrypted GeneralInvoice and are excluded for locked invoices.
+   *
+   * @param invoices        - The invoice population to analyse
+   * @param options.dueSoonDays - Window for dueSoonCount (default: 7)
+   */
+  static computeDashboardStats(
+    invoices: MajikInvoice[],
+    options: { dueSoonDays?: number } = {},
+  ): DashboardStats {
+    const { dueSoonDays = 7 } = options;
+
+    const today = new Date().toISOString().slice(0, 10);
+    const dueSoonCutoff = new Date(Date.now() + dueSoonDays * 86_400_000)
+      .toISOString()
+      .slice(0, 10);
+
+    // ── Accumulators ──────────────────────────────────────────────────────────
+    const byStatus: Record<string, number> = {};
+    const byStatusAmount: Record<string, number> = {};
+    const recipientMap = new Map<
+      string,
+      { totalAmount: number; count: number; paidAmount: number }
+    >();
+    const issuerSet = new Set<string>();
+    const taxTypeMap = new Map<
+      string,
+      { total: number; rateSum: number; count: number }
+    >();
+    const allAmounts: number[] = [];
+    const daysToPaymentList: number[] = [];
+
+    let totalAmount = 0;
+    let paidAmount = 0;
+    let partialAmount = 0;
+    let overdueAmount = 0;
+    let totalCollected = 0;
+    let totalOutstanding = 0;
+    let taxCollected = 0;
+    let withholdingTotal = 0;
+    let netPayable = 0;
+    let discountGiven = 0;
+    let weightedTaxRate = 0; // numerator for weighted avg
+    let weightedTaxBase = 0;
+    let paidCount = 0;
+    let partialCount = 0;
+    let overdueCount = 0;
+    let draftCount = 0;
+    let voidCount = 0;
+    let encryptedCount = 0;
+    let unsignedCount = 0;
+    let dueSoonCount = 0;
+    let oldestDate: string | null = null;
+    let newestDate: string | null = null;
+
+    for (const inv of invoices) {
+      const pub = inv.public;
+      const invStatus = pub.status ?? "draft";
+      const invAmount = pub.totalAmount ?? 0;
+
+      // ── Status buckets ──────────────────────────────────────────────────────
+      byStatus[invStatus] = (byStatus[invStatus] ?? 0) + 1;
+      byStatusAmount[invStatus] = (byStatusAmount[invStatus] ?? 0) + invAmount;
+
+      totalAmount += invAmount;
+      allAmounts.push(invAmount);
+
+      if (invStatus === "paid") {
+        paidAmount += invAmount;
+        paidCount++;
+      }
+      if (invStatus === "partial") {
+        partialAmount += invAmount;
+        partialCount++;
+      }
+      if (invStatus === "overdue") {
+        overdueAmount += invAmount;
+        overdueCount++;
+      }
+      if (invStatus === "draft") draftCount++;
+      if (invStatus === "void") voidCount++;
+      if (inv.status === "unsigned") unsignedCount++;
+      if (inv.isEncrypted && !inv.hasDecryptedCache) encryptedCount++;
+
+      // ── Temporal ─────────────────────────────────────────────────────────────
+      const issuedAt = pub.issuedAt?.slice(0, 10) ?? null;
+      if (issuedAt) {
+        if (!oldestDate || issuedAt < oldestDate) oldestDate = issuedAt;
+        if (!newestDate || issuedAt > newestDate) newestDate = issuedAt;
+      }
+
+      const dueDate = pub.dueDate?.slice(0, 10) ?? null;
+      if (dueDate && dueDate >= today && dueDate <= dueSoonCutoff) {
+        dueSoonCount++;
+      }
+
+      // ── Detailed financials — only available when plaintext is accessible ────
+      let gi: GeneralInvoice | null = null;
+      try {
+        if (inv.mode === "signed-only" || inv.hasDecryptedCache) {
+          gi = inv.invoice;
+        }
+      } catch {
+        gi = null;
+      }
+
+      // ── Relationships ────────────────────────────────────────────────────────
+      issuerSet.add(pub.issuerName);
+
+      const recip = recipientMap.get(
+        gi?.recipient?.legalName || pub.recipientName || "UNKNOWN_RECIPIENT",
+      ) ?? {
+        totalAmount: 0,
+        count: 0,
+        paidAmount: 0,
+      };
+      recip.totalAmount += invAmount;
+      recip.count++;
+      if (invStatus === "paid") recip.paidAmount += invAmount;
+      recipientMap.set(
+        gi?.recipient?.legalName || pub.recipientName || "UNKNOWN_RECIPIENT",
+        recip,
+      );
+
+      if (gi) {
+        totalCollected += gi.totalPaid.toMajor();
+        totalOutstanding += gi.amountDue.toMajor();
+        taxCollected += gi.taxAmount;
+        withholdingTotal += gi.withholdingAmount;
+        netPayable += gi.netPayableAmount;
+        discountGiven += gi.discountAmount;
+
+        if (gi.subtotalAmount > 0) {
+          weightedTaxRate += gi.taxAmount;
+          weightedTaxBase += gi.subtotalAmount;
+        }
+
+        // Days to first payment
+        if (gi.proofOfPayments.length > 0 && gi.issueDate) {
+          const issueMs = new Date(gi.issueDate).getTime();
+          const firstPayMs = new Date(
+            gi.proofOfPayments[0].settledAt,
+          ).getTime();
+          const days = (firstPayMs - issueMs) / 86_400_000;
+          if (days >= 0) daysToPaymentList.push(days);
+        }
+
+        // Tax breakdown by type
+        for (const entry of gi.taxBreakdown()) {
+          if (entry.behaviour !== "additive") continue;
+          const existing = taxTypeMap.get(entry.taxType) ?? {
+            total: 0,
+            rateSum: 0,
+            count: 0,
+          };
+          existing.total += entry.taxAmount;
+          existing.rateSum += entry.rate;
+          existing.count++;
+          taxTypeMap.set(entry.taxType, existing);
+        }
+      }
+    }
+
+    // ── Derived ────────────────────────────────────────────────────────────────
+    const unpaidAmount = totalAmount - paidAmount - partialAmount;
+    const effectiveTaxRate =
+      weightedTaxBase > 0 ? weightedTaxRate / weightedTaxBase : 0;
+
+    const avgInvoiceValue =
+      allAmounts.length > 0
+        ? allAmounts.reduce((s, v) => s + v, 0) / allAmounts.length
+        : 0;
+    const largestInvoice = allAmounts.length > 0 ? Math.max(...allAmounts) : 0;
+    const smallestInvoice = allAmounts.length > 0 ? Math.min(...allAmounts) : 0;
+
+    const sorted = [...allAmounts].sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    const medianInvoiceValue =
+      sorted.length === 0
+        ? 0
+        : sorted.length % 2 === 0
+          ? (sorted[mid - 1] + sorted[mid]) / 2
+          : sorted[mid];
+
+    const avgDaysToPayment =
+      daysToPaymentList.length > 0
+        ? daysToPaymentList.reduce((s, v) => s + v, 0) /
+          daysToPaymentList.length
+        : null;
+
+    const topRecipients = Array.from(recipientMap.entries())
+      .map(([name, v]) => ({ name, ...v }))
+      .sort((a, b) => b.totalAmount - a.totalAmount)
+      .slice(0, 10);
+
+    const taxBreakdown = Array.from(taxTypeMap.entries()).map(
+      ([taxType, v]) => ({
+        taxType,
+        amount: v.total,
+        rate: v.count > 0 ? v.rateSum / v.count : 0,
+      }),
+    );
+
+    return {
+      total: invoices.length,
+      paidCount,
+      partialCount,
+      overdueCount,
+      draftCount,
+      voidCount,
+      encryptedCount,
+      unsignedCount,
+      byStatus,
+      totalAmount,
+      paidAmount,
+      partialAmount,
+      unpaidAmount,
+      overdueAmount,
+      byStatusAmount,
+      totalCollected,
+      totalOutstanding,
+      avgDaysToPayment,
+      taxCollected,
+      withholdingTotal,
+      netPayable,
+      discountGiven,
+      effectiveTaxRate,
+      taxBreakdown,
+      avgInvoiceValue,
+      largestInvoice,
+      smallestInvoice,
+      medianInvoiceValue,
+      topRecipients,
+      uniqueRecipientCount: recipientMap.size,
+      uniqueIssuerCount: issuerSet.size,
+      oldestInvoiceDate: oldestDate,
+      newestInvoiceDate: newestDate,
+      dueSoonCount,
+    };
+  }
+
+  // ==========================================================================
   // ── Binary ──────────────────────────────────────────────────────────
   // ==========================================================================
 
@@ -1639,7 +2104,7 @@ export class MajikInvoice {
   // ── PRIVATE HELPERS ────────────────────────────────────────────────────────
   // ==========================================================================
 
-  private _reissueFromMutation(updatedInvoice: GeneralInvoice): MajikInvoice {
+  protected _reissueFromMutation(updatedInvoice: GeneralInvoice): MajikInvoice {
     // NOTE:
     // - drops signatures (correct)
     // - preserves mode

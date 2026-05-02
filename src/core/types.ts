@@ -71,7 +71,7 @@ export interface PublicInvoiceSummary {
   dueDate?: ISODateString;
   invoiceNumber?: string;
   status: InvoiceStatus;
-  paymentStatus: PaymentStatus
+  paymentStatus: PaymentStatus;
 }
 
 // ---------------------------------------------------------------------------
@@ -268,4 +268,60 @@ export interface MajikInvoiceConstructorOptions {
   createdAt: ISODateTimeString;
   updatedAt: ISODateTimeString;
   decrypted?: DecryptedCache;
+}
+
+export interface DashboardStats {
+  // ── Counts ────────────────────────────────
+  total: number;
+  paidCount: number;
+  partialCount: number;
+  overdueCount: number;
+  draftCount: number;
+  voidCount: number;
+  encryptedCount: number; // locked encrypted invoices
+  unsignedCount: number;
+  byStatus: Record<string, number>;
+
+  // ── Amounts ───────────────────────────────
+  totalAmount: number; // sum of all grandTotals
+  paidAmount: number; // sum of grandTotals for status === "paid"
+  partialAmount: number; // sum of grandTotals for status === "partial"
+  unpaidAmount: number; // totalAmount - paidAmount - partialAmount
+  overdueAmount: number; // sum of grandTotals for status === "overdue"
+  byStatusAmount: Record<string, number>;
+
+  // ── Payment settlement ────────────────────
+  totalCollected: number; // sum of all proofOfPayments.amount across all invoices
+  totalOutstanding: number; // sum of amountDue across accessible invoices
+  avgDaysToPayment: number | null; // avg days between issueDate and first payment settledAt
+
+  // ── Tax & financials ──────────────────────
+  taxCollected: number; // sum of taxAmount across accessible invoices
+  withholdingTotal: number;
+  netPayable: number; // sum of netPayableAmount
+  discountGiven: number;
+  effectiveTaxRate: number; // weighted average
+  taxBreakdown: Array<{ taxType: string; amount: number; rate: number }>;
+
+  // ── Invoice sizing ────────────────────────
+  avgInvoiceValue: number;
+  largestInvoice: number;
+  smallestInvoice: number;
+  medianInvoiceValue: number;
+
+  // ── Relationships ─────────────────────────
+  topRecipients: Array<{
+    name: string;
+    totalAmount: number;
+    count: number;
+    paidAmount: number;
+  }>;
+  uniqueRecipientCount: number;
+  uniqueIssuerCount: number;
+
+  // ── Temporal ─────────────────────────────
+  oldestInvoiceDate: string | null;
+  newestInvoiceDate: string | null;
+  /** count of invoices whose dueDate is within the next N days (default 7) */
+  dueSoonCount: number;
 }

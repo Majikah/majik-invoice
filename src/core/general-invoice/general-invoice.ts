@@ -131,6 +131,7 @@ export class GeneralInvoice {
   private rebuild(
     overrides: Partial<InvoiceInternalState>,
     lineItems?: LineItem[],
+    payments?: ProofOfPayment[], // ← new optional arg
   ): GeneralInvoice {
     const items = lineItems ?? [...this.lineItems];
     const totals = InvoiceTotals.fromLineItems(items, this.currency);
@@ -159,6 +160,7 @@ export class GeneralInvoice {
       },
       items,
       totals,
+      payments ?? [...this.proofOfPayments],
     );
   }
 
@@ -1123,9 +1125,7 @@ export class GeneralInvoice {
     }
 
     // ── Rebuild ────────────────────────────────
-    const updated = this.rebuild({
-      proofOfPayments: sorted,
-    });
+    const updated = this.rebuild({}, undefined, sorted);
 
     const paid = updated.totalPaid;
     const total = updated.totals.grandTotal;
@@ -1568,6 +1568,7 @@ export class GeneralInvoice {
         metadata: deserializeMoney(json.metadata),
         createdAt: json.createdAt,
         updatedAt: json.updatedAt,
+        proofOfPayments: json.proofOfPayments ?? [],
       },
       lineItems,
       totals,
