@@ -8,24 +8,6 @@
  * Two modes:
  *   "signed-only"          — GeneralInvoice is plaintext, integrity-sealed
  *   "encrypted-and-signed" — GeneralInvoice is encrypted; only public summary
- *                            fields are visible without the recipient's key
- *
- * Design principles:
- *   - Private constructor — always use MajikInvoice.create()
- *   - Mode is set at construction and immutable; conversion returns a new instance
- *   - MajikKey is the primary key interface (unlock-check is built in)
- *   - Full multi-sig via MajikSignature's allowlist/seal pattern
- *   - Decrypted state is cached on the instance (decrypted?: DecryptedCache)
- *   - Single recipient now; multi-recipient available via recipientKeys array
- *     backed by MajikEnvelope's group mode
- *   - toJSON() / fromJSON() are round-trip stable and safe to persist
- *   - toCanonicalBytes() is deterministic — used internally for signing
- *
- * Status vocabulary:
- *   "sealed"    — signed (and optionally encrypted); integrity intact
- *   "unsigned"  — created but not yet signed
- *   "decrypted" — encrypted invoice that has been decrypted in this session
- *   "invalid"   — signature or structural verification failed
  */
 
 import { GeneralInvoice } from "./general-invoice";
@@ -46,7 +28,7 @@ import {
   type MajikRecipient,
   type MajikIdentity,
 } from "@majikah/majik-envelope";
-import type { MajikKey } from "@majikah/majik-key";
+import type { MajikKey, MajikMessagePublicKey } from "@majikah/majik-key";
 
 import { hash } from "@stablelib/sha256";
 import {
@@ -62,6 +44,7 @@ import {
   MajikInvoicePayload,
   MajikInvoiceStatus,
   MajikInvoiceValidationResult,
+  MajikUserID,
   PublicInvoiceSummary,
   SignedOnlyPayload,
 } from "./types";
@@ -75,6 +58,15 @@ import {
 } from "./errors";
 import { MJKI_HEADER_SIZE, MJKI_MAGIC, MJKI_VERSION } from "./binary";
 import { MajikMoney } from "@thezelijah/majik-money";
+import {
+  buildCSVHeader,
+  buildCSVRow,
+  CSVColumn,
+  CSVExportResult,
+  CSVResolveContext,
+  dedupeColumns,
+  DEFAULT_CSV_COLUMNS,
+} from "./csv-export";
 
 // ── Batch / stats types ───────────────────────────────────────────────────
 
@@ -1986,9 +1978,6 @@ export class MajikInvoice {
       public: { ...this.public },
       payload: this.payload,
       integrity: { ...this.integrity },
-
-      userId: this.userId,
-      accountId: this.accountId,
       createdAt: this.createdAt,
       updatedAt: this.updatedAt,
     };
@@ -1998,12 +1987,14 @@ export class MajikInvoice {
    * Generates a MajikahInvoiceJSON for cloud routing.
    * Ensures ownership and routing fields are present.
    */
-  toMajikahInvoiceJSON(options?: {
-    userId?: string;
-    accountId?: string;
-    recipients?: string[];
-    publicKey?: string;
-  }): MajikahInvoiceJSON {
+  toMajikahInvoiceJSON(
+    sender: MajikMessagePublicKey,
+    recipients: MajikMessagePublicKey[],
+    options?: {
+      userId?: string;
+      accountId?: string;
+    },
+  ): MajikahInvoiceJSON {
     const finalUserId = options?.userId ?? this.userId;
     if (!finalUserId?.trim()) {
       throw new MajikInvoiceError(
@@ -2011,40 +2002,27 @@ export class MajikInvoice {
       );
     }
 
-    const finalAccountId = options?.accountId ?? this.accountId ?? finalUserId;
-
-    let finalRecipients = options?.recipients;
-    if (!finalRecipients || finalRecipients.length === 0) {
-      const signers = new Set<string>();
-      if (this.integrity.signatures.length > 0) {
-        signers.add(this.integrity.signatures[0].signerId);
-      }
-      if (this.integrity.expectedSigners) {
-        this.integrity.expectedSigners.forEach((s) => signers.add(s.signerId));
-      }
-      finalRecipients = Array.from(signers);
-    }
-
-    let finalPublicKey: string = "";
-    if (this.integrity.signatures.length > 0) {
-      const firstSig = this.integrity.signatures[0];
-      // Type assertion since publicKey comes from MajikSignatureJSON
-      finalPublicKey = options?.publicKey ?? firstSig.signerEdPublicKey;
-    }
-
-    if (!finalPublicKey?.trim()) {
+    if (!recipients || recipients.length === 0) {
       throw new MajikInvoiceError(
-        "publicKey is required to generate a MajikahInvoiceJSON.",
+        "At least 1 recipient is required to generate a MajikahInvoiceJSON.",
       );
     }
+
+    if (!sender?.trim()) {
+      throw new MajikInvoiceError(
+        "Sender Public Key is required to generate a MajikahInvoiceJSON.",
+      );
+    }
+
+    const finalAccountId = options?.accountId ?? this.accountId ?? finalUserId;
 
     const baseJSON = this.toJSON();
     return {
       ...baseJSON,
       user_id: finalUserId,
       account_id: finalAccountId,
-      recipients: finalRecipients,
-      public_key: finalPublicKey,
+      recipients: recipients,
+      public_key: sender,
     };
   }
 
@@ -2327,6 +2305,109 @@ export class MajikInvoice {
         );
       }
     }
+  }
+
+  // ==========================================================================
+  // ── CSV EXPORT — add inside the MajikInvoice class body ────────────────────
+  // ==========================================================================
+
+  /**
+   * Export an array of MajikInvoice instances to a single CSV string.
+   *
+   * Behaviour per invoice:
+   *
+   *   signed-only              → full data row using the GeneralInvoice
+   *   encrypted + decrypted    → full data row using the cached GeneralInvoice
+   *   encrypted + locked       → partial row using only PublicInvoiceSummary
+   *                              fields; all GeneralInvoice-only columns are
+   *                              left blank. The invoice IS still included in
+   *                              the output — it is never silently dropped.
+   *
+   */
+  static async batchExportToCSV(
+    invoices: MajikInvoice[],
+    options: {
+      columns?: CSVColumn[];
+    } = {},
+  ): Promise<CSVExportResult> {
+    const rawColumns = options.columns ?? DEFAULT_CSV_COLUMNS;
+    const columns = dedupeColumns(rawColumns);
+
+    const partialExports: CSVExportResult["partialExports"] = [];
+    const errors: CSVExportResult["errors"] = [];
+    const rows: string[] = [];
+
+    // Header row — always present even if there are zero invoices
+    rows.push(buildCSVHeader(columns));
+
+    for (const inv of invoices) {
+      try {
+        // ── Resolve the GeneralInvoice (or fall back to public summary) ────────
+        let generalInvoice: GeneralInvoice | undefined;
+
+        if (inv.mode === "signed-only") {
+          // Safe — plaintext is always accessible
+          generalInvoice = inv.invoice;
+        } else if (inv.hasDecryptedCache) {
+          // Encrypted but already decrypted this session
+          generalInvoice = inv.invoice;
+        } else {
+          // Encrypted and locked — we cannot access GeneralInvoice fields.
+          // Export what we can from the public summary and note the gap.
+          generalInvoice = undefined;
+
+          // Identify which columns will be blank so we can report them
+          const unavailable = columns
+            .filter((col) => {
+              // Probe: try resolving with no invoice; blank result = unavailable
+              try {
+                const ctx: CSVResolveContext = {
+                  invoice: undefined,
+                  public: inv.public,
+                  invoiceId: inv.id,
+                };
+                const val = col.resolve(ctx);
+                return val === "";
+              } catch {
+                return true;
+              }
+            })
+            .map((col) => col.key);
+
+          partialExports.push({
+            invoiceId: inv.id,
+            reason: "encrypted-no-cache",
+            unavailableColumns: unavailable,
+          });
+        }
+
+        // ── Build the row ──────────────────────────────────────────────────────
+        const ctx: CSVResolveContext = {
+          invoice: generalInvoice,
+          public: inv.public,
+          invoiceId: inv.id,
+        };
+
+        rows.push(buildCSVRow(ctx, columns));
+      } catch (err) {
+        // Hard failure — skip this invoice's row but record the error
+        errors.push({
+          invoiceId: inv.id,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    const csv = rows.join("\n");
+    const success = partialExports.length === 0 && errors.length === 0;
+
+    return {
+      csv,
+      count: invoices.length,
+      success,
+      partialExports,
+      errors,
+    };
   }
 }
 

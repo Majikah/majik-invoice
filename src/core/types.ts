@@ -4,7 +4,7 @@
  * proof of payment, and the Majikah cloud envelope (MajikahInvoiceJSON).
  */
 
-import type { MajikKey } from "@majikah/majik-key";
+import type { MajikKey, MajikMessagePublicKey } from "@majikah/majik-key";
 import type {
   CurrencyCode,
   GeneralInvoice,
@@ -15,7 +15,6 @@ import type {
   ISODateString,
   ISODateTimeString,
   PaymentStatus,
-  ProofOfPayment,
 } from "./general-invoice";
 import type {
   ExpectedSigner,
@@ -23,6 +22,8 @@ import type {
   SealInfo,
 } from "@majikah/majik-signature";
 import { MajikRecipient } from "@majikah/majik-envelope";
+
+export type MajikUserID = string;
 
 // ---------------------------------------------------------------------------
 // Mode
@@ -189,10 +190,6 @@ export interface MajikInvoiceJSON {
   public: PublicInvoiceSummary;
   payload: MajikInvoicePayload;
   integrity: IntegrityBlock;
-  /** Optional cloud user identifier */
-  userId?: string;
-  /** Optional cloud organization/account identifier */
-  accountId?: string;
   createdAt: ISODateTimeString;
   updatedAt: ISODateTimeString;
 }
@@ -236,7 +233,7 @@ export interface MajikahInvoiceJSON extends MajikInvoiceJSON {
    */
   recipients: string[];
   /**
-   * Ed25519 public key of the original invoice issuer.
+   * X25519 public key of the original invoice issuer.
    * Taken from `MajikKeyJSON.publicKey` — base64-encoded.
    * Derived from the first attached signature at serialization time.
    * Allows recipients to verify the issuer's identity without a keyserver lookup.

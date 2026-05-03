@@ -3,3 +3,7 @@ export * from "./core/errors";
 export { MajikInvoice } from "./core/majik-invoice";
 
 export * from "./core/general-invoice";
+
+export * from "./core/csv-export";
+
+

@@ -50,6 +50,7 @@ import {
   SCHEMA_VERSION,
 } from "./constants";
 import { MajikInvoiceInput } from "../types";
+import { buildCSVHeader, buildCSVRow, CSVColumn, CSVResolveContext, DEFAULT_CSV_COLUMNS } from "../csv-export";
 
 export class GeneralInvoice {
   // ── Identity ──────────────────────────────────────────────────────────────
@@ -1572,6 +1573,7 @@ export class GeneralInvoice {
       },
       lineItems,
       totals,
+      json.proofOfPayments,
     );
   }
 
@@ -1588,5 +1590,64 @@ export class GeneralInvoice {
   toCanonicalJSON(): string {
     const json = this.toJSON();
     return JSON.stringify(json, Object.keys(json).sort());
+  }
+
+  // ==========================================================================
+  // ── CSV EXPORT — add inside the GeneralInvoice class body ──────────────────
+  // ==========================================================================
+
+  // Add this import at the top of general-invoice.ts:
+  //
+  //   import {
+  //     CSVColumn,
+  //     CSVResolveContext,
+  //     DEFAULT_CSV_COLUMNS,
+  //     buildCSVHeader,
+  //     buildCSVRow,
+  //   } from "./csv-export";
+
+  /**
+   * Export this invoice as a CSV string.
+   *
+   * Includes a header row followed by a single data row.
+   * For multi-invoice export use `MajikInvoice.batchExportToCSV()` instead —
+   * that method writes one header row followed by one row per invoice.
+   *
+   * @param columns - Columns to include. Defaults to DEFAULT_CSV_COLUMNS.
+   *
+   * @example — defaults
+   * const csv = invoice.toCSV();
+   *
+   * @example — custom columns
+   * import { ALL_CSV_COLUMNS, buildTaxBreakdownColumns } from "./csv-export";
+   * const csv = invoice.toCSV([
+   *   ...ALL_CSV_COLUMNS,
+   *   ...buildTaxBreakdownColumns(["VAT", "EWT"]),
+   * ]);
+   */
+  toCSV(columns: CSVColumn[] = DEFAULT_CSV_COLUMNS): string {
+    const ctx: CSVResolveContext = {
+      invoice: this,
+      invoiceId: this.id,
+    };
+
+    const header = buildCSVHeader(columns);
+    const row = buildCSVRow(ctx, columns);
+    return `${header}\n${row}`;
+  }
+
+  /**
+   * Export only the data row (no header).
+   * Used internally by MajikInvoice.batchExportToCSV() to assemble
+   * a multi-row file with a single shared header.
+   *
+   * @internal
+   */
+  toCSVRow(columns: CSVColumn[] = DEFAULT_CSV_COLUMNS): string {
+    const ctx: CSVResolveContext = {
+      invoice: this,
+      invoiceId: this.id,
+    };
+    return buildCSVRow(ctx, columns);
   }
 }
