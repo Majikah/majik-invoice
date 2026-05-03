@@ -2023,6 +2023,8 @@ export class MajikInvoice {
       account_id: finalAccountId,
       recipients: recipients,
       public_key: sender,
+      sent_at: new Date().toISOString(),
+      status: this.public.status
     };
   }
 

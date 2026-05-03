@@ -239,6 +239,10 @@ export interface MajikahInvoiceJSON extends MajikInvoiceJSON {
    * Allows recipients to verify the issuer's identity without a keyserver lookup.
    */
   public_key: string;
+
+  status: string;
+
+  sent_at: ISODateTimeString;
 }
 
 // ---------------------------------------------------------------------------
