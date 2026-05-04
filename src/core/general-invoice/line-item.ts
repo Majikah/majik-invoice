@@ -28,6 +28,7 @@ export class LineItemValidationError extends Error {
 export class LineItem {
   // ── Identity ──────────────────────────────────────────────────────────────
   readonly id: string;
+  readonly skuId?: string;
   readonly description: string;
   readonly quantity: number;
   readonly unit?: string;
@@ -87,6 +88,7 @@ export class LineItem {
     defaultTaxes?: TaxManager,
   ) {
     this.id = input.id ?? crypto.randomUUID();
+    this.skuId = input?.skuId;
     this.description = input.description.trim();
     this.quantity = input.quantity;
     this.unit = input.unit;
@@ -307,6 +309,7 @@ export class LineItem {
   toJSON(): LineItemJSON {
     return {
       id: this.id,
+      skuId: this.skuId,
       description: this.description,
       quantity: this.quantity,
       unitPrice: serializeMoney(this.unitPrice),
@@ -331,6 +334,7 @@ export class LineItem {
     const unitPriceMoney = deserializeMoney(json.unitPrice) as MajikMoney;
     const input: LineItemInput = {
       id: json.id,
+      skuId: json.skuId,
       description: json.description,
       quantity: json.quantity,
       unitPrice: unitPriceMoney.toMajor(),

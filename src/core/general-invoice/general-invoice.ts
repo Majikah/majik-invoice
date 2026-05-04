@@ -50,7 +50,13 @@ import {
   SCHEMA_VERSION,
 } from "./constants";
 import { MajikInvoiceInput } from "../types";
-import { buildCSVHeader, buildCSVRow, CSVColumn, CSVResolveContext, DEFAULT_CSV_COLUMNS } from "../csv-export";
+import {
+  buildCSVHeader,
+  buildCSVRow,
+  CSVColumn,
+  CSVResolveContext,
+  DEFAULT_CSV_COLUMNS,
+} from "../csv-export";
 
 export class GeneralInvoice {
   // ── Identity ──────────────────────────────────────────────────────────────
@@ -289,6 +295,17 @@ export class GeneralInvoice {
     return this.rebuild({ notes: notes.trim() });
   }
 
+  private _appendNotes(note: string): GeneralInvoice {
+    const trimmed = note.trim();
+    if (!trimmed) return this;
+
+    const existing = this.notes?.trim();
+
+    const notes = existing ? `${existing}\n\n${trimmed}` : trimmed;
+
+    return this.withNotes(notes);
+  }
+
   withoutNotes(): GeneralInvoice {
     this.assertEditable("clear notes");
     return this.rebuild({ notes: undefined });
@@ -402,18 +419,32 @@ export class GeneralInvoice {
     return this.withStatus("overdue");
   }
 
-  dispute(): GeneralInvoice {
-    return this.withStatus("disputed");
+  dispute(reason?: string): GeneralInvoice {
+    const trimmedReason = reason?.trim();
+    if (!trimmedReason) return this.withStatus("disputed");
+
+    return this.withStatus("disputed")._appendNotes(
+      `VOID REASON: ${trimmedReason}`,
+    );
   }
 
-  resolveDispute(): GeneralInvoice {
-    return this.withStatus("issued");
+  resolveDispute(reason?: string): GeneralInvoice {
+    const trimmedReason = reason?.trim();
+    if (!trimmedReason) return this.withStatus("issued");
+
+    return this.withStatus("issued")._appendNotes(
+      `VOID REASON: ${trimmedReason}`,
+    );
   }
 
-  voidInvoice(): GeneralInvoice {
-    return this.withStatus("void");
-  }
+  voidInvoice(reason?: string): GeneralInvoice {
+    const trimmedReason = reason?.trim();
+    if (!trimmedReason) return this.withStatus("void");
 
+    return this.withStatus("void")._appendNotes(
+      `VOID REASON: ${trimmedReason}`,
+    );
+  }
   // ── Dates & terms (unchanged) ─────────────────────────────────────────────
 
   withIssueDate(date: ISODateString): GeneralInvoice {
@@ -1581,14 +1612,46 @@ export class GeneralInvoice {
   // ── CANONICAL BYTES — for signing ──────────────────────────────────────────
   // ==========================================================================
 
+  /**
+   * Returns the subset of invoice fields that form the cryptographic commitment.
+   *
+   * Excluded intentionally:
+   *   - version      — schema bumps must not invalidate old signatures
+   *   - status       — lifecycle transitions (draft → issued → paid) are post-signing
+   *   - notes        — can be amended by either party (dispute reasons, etc.)
+   *   - tags         — organisational metadata, not a financial term
+   *   - metadata     — arbitrary key-value bag, not a financial term
+   *   - proofOfPayments — added by payer after signing
+   *   - createdAt / updatedAt — timestamps drift across serialization roundtrips
+   */
+  private toSignableJSON(): object {
+    return {
+      id: this.id,
+      invoiceNumber: this.invoiceNumber,
+      type: this.type,
+      issuer: this.issuer,
+      recipient: this.recipient,
+      currency: this.currency,
+      issueDate: this.issueDate,
+      dueDate: this.dueDate,
+      period: this.period,
+      paymentTerms: this.paymentTerms,
+      lineItems: this.lineItems.map((li) => li.toJSON()),
+      defaultTaxes: this.defaultTaxes.toArray(),
+      references: this.references ? [...this.references] : undefined,
+    };
+  }
+
+  // ── Update toCanonicalBytes() and toCanonicalJSON() ────────────────────────
+
   toCanonicalBytes(): Uint8Array {
-    const json = this.toJSON();
+    const json = this.toSignableJSON();
     const canonical = JSON.stringify(json, Object.keys(json).sort());
     return new TextEncoder().encode(canonical);
   }
 
   toCanonicalJSON(): string {
-    const json = this.toJSON();
+    const json = this.toSignableJSON();
     return JSON.stringify(json, Object.keys(json).sort());
   }
 

@@ -190,8 +190,8 @@ export interface MajikInvoiceJSON {
   public: PublicInvoiceSummary;
   payload: MajikInvoicePayload;
   integrity: IntegrityBlock;
-  createdAt: ISODateTimeString;
-  updatedAt: ISODateTimeString;
+  created_at: ISODateTimeString;
+  updated_at: ISODateTimeString;
 }
 
 // ---------------------------------------------------------------------------
@@ -224,12 +224,9 @@ export interface MajikahInvoiceJSON extends MajikInvoiceJSON {
    */
   account_id: string;
   /**
-   * Recipient identifiers for cloud routing.
+   * Recipient Public Key identifiers for cloud routing.
    * Used to deliver the invoice to the correct user(s) or org(s).
    *
-   * Defaults to:
-   *   [issuer's signer fingerprint, ...expectedSigner fingerprints]
-   * when not explicitly provided.
    */
   recipients: string[];
   /**

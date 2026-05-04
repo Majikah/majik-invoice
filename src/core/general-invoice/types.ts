@@ -422,6 +422,7 @@ export interface TaxDetail {
 // ---------------------------------------------------------------------------
 
 export interface LineItemInput {
+  skuId?: string;
   id?: string;
   description: string;
   quantity: number;
@@ -447,6 +448,7 @@ export interface LineItemInput {
 
 export interface LineItemJSON {
   id: string;
+  skuId?: string;
   description: string;
   quantity: number;
   unitPrice: Record<string, unknown>;

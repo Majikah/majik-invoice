@@ -442,6 +442,8 @@ export class MajikInvoice {
       hashAlgorithm: "SHA-256",
       signatures: [],
       isSealed: false,
+      expectedSigners: this.integrity.expectedSigners,
+      allowlistSignerId: this.integrity.allowlistSignerId,
     };
 
     const converted = new MajikInvoice({
@@ -489,10 +491,12 @@ export class MajikInvoice {
     };
 
     const integrity: IntegrityBlock = {
-      contentHash,
+      contentHash: this.integrity.contentHash,
       hashAlgorithm: "SHA-256",
       signatures: [],
       isSealed: false,
+      expectedSigners: this.integrity.expectedSigners,
+      allowlistSignerId: this.integrity.allowlistSignerId,
     };
 
     const converted = new MajikInvoice({
@@ -653,10 +657,6 @@ export class MajikInvoice {
    * All existing signatures are dropped — the caller must re-sign.
    * Mode, createdAt, and (if encrypted) recipient fingerprints are preserved.
    *
-   * Typical usage:
-   *   const updated = invoice.invoice.withLineItem({ ... }).withNotes("...");
-   *   const reissued = await invoice.reissue(updated, { signerKey: aliceKey });
-   *
    * @throws {MajikInvoiceKeyError} if mode is "encrypted-and-signed" and no recipientKeys provided
    * @throws {MajikInvoiceKeyError} if signerKey is locked or missing signing keys
    * @throws {MajikInvoiceEncryptionError} if re-encryption fails
@@ -665,7 +665,6 @@ export class MajikInvoice {
     updatedInvoice: GeneralInvoice,
     options: {
       signerKey?: MajikKey;
-      /** Required when mode is "encrypted-and-signed" */
       recipients?: MajikRecipient[];
       expectedSigners?: ExpectedSigner[];
     } = {},
@@ -683,39 +682,42 @@ export class MajikInvoice {
       MajikInvoice._assertKeyHasSigningKeys(options.signerKey, "reissue");
     }
 
-    const publicSummary = MajikInvoice._buildPublicSummary(updatedInvoice);
-    const canonicalBytes = updatedInvoice.toCanonicalBytes();
-    const contentHash = MajikInvoice._sha256Hex(canonicalBytes);
+    let reissued: MajikInvoice;
 
-    let payload: MajikInvoicePayload;
     if (this.mode === "encrypted-and-signed") {
-      payload = await MajikInvoice._buildEncryptedPayload(
+      // Encrypted path — must rebuild payload manually since _reissueFromMutation
+      // cannot handle re-encryption without recipients context.
+      const publicSummary = MajikInvoice._buildPublicSummary(updatedInvoice);
+      const contentHash = MajikInvoice._sha256Hex(
+        updatedInvoice.toCanonicalBytes(),
+      );
+      const payload = await MajikInvoice._buildEncryptedPayload(
         updatedInvoice,
         options.recipients!,
       );
+      const integrity: IntegrityBlock = {
+        contentHash,
+        hashAlgorithm: "SHA-256",
+        signatures: [],
+        isSealed: false,
+        expectedSigners: this.integrity.expectedSigners,
+        allowlistSignerId: this.integrity.allowlistSignerId,
+      };
+      reissued = new MajikInvoice({
+        id: updatedInvoice.id,
+        mode: this.mode,
+        public: publicSummary,
+        payload,
+        integrity,
+        createdAt: this.createdAt,
+        updatedAt: new Date().toISOString(),
+      });
     } else {
-      payload = {
-        kind: "signed-only",
-        invoice: updatedInvoice.toJSON(),
-      } satisfies SignedOnlyPayload;
+      // Signed-only path — delegate to _reissueFromMutation with hash recompute.
+      reissued = this._reissueFromMutation(updatedInvoice, {
+        recomputeHash: true,
+      });
     }
-
-    const integrity: IntegrityBlock = {
-      contentHash,
-      hashAlgorithm: "SHA-256",
-      signatures: [],
-      isSealed: false,
-    };
-
-    const reissued = new (this.constructor as typeof MajikInvoice)({
-      id: updatedInvoice.id,
-      mode: this.mode,
-      public: publicSummary,
-      payload,
-      integrity,
-      createdAt: this.createdAt,
-      updatedAt: new Date().toISOString(),
-    });
 
     if (options.signerKey) {
       return reissued.sign(
@@ -1978,8 +1980,8 @@ export class MajikInvoice {
       public: { ...this.public },
       payload: this.payload,
       integrity: { ...this.integrity },
-      createdAt: this.createdAt,
-      updatedAt: this.updatedAt,
+      created_at: this.createdAt,
+      updated_at: this.updatedAt,
     };
   }
 
@@ -2024,7 +2026,7 @@ export class MajikInvoice {
       recipients: recipients,
       public_key: sender,
       sent_at: new Date().toISOString(),
-      status: this.public.status
+      status: this.public.status,
     };
   }
 
@@ -2053,8 +2055,8 @@ export class MajikInvoice {
         integrity: parsed.integrity,
         userId: resolvedUserId,
         accountId: resolvedAccountId,
-        createdAt: parsed.createdAt,
-        updatedAt: parsed.updatedAt,
+        createdAt: parsed.created_at,
+        updatedAt: parsed.updated_at,
       });
 
       const validation = instance._validateStructure();
@@ -2084,15 +2086,30 @@ export class MajikInvoice {
   // ── PRIVATE HELPERS ────────────────────────────────────────────────────────
   // ==========================================================================
 
-  protected _reissueFromMutation(updatedInvoice: GeneralInvoice): MajikInvoice {
+  protected _reissueFromMutation(
+    updatedInvoice: GeneralInvoice,
+    options: {
+      /**
+       * When true, recomputes contentHash from the updated invoice.
+       * Use this ONLY for genuine financial edits (reissue() path).
+       * Default: false — preserves existing contentHash so signatures remain valid.
+       */
+      recomputeHash?: boolean;
+    } = {},
+  ): MajikInvoice {
     // NOTE:
-    // - drops signatures (correct)
+    // - drops signatures (correct for financial edits)
     // - preserves mode
     // - DOES NOT auto-sign (caller decides)
 
     const publicSummary = MajikInvoice._buildPublicSummary(updatedInvoice);
-    const canonicalBytes = updatedInvoice.toCanonicalBytes();
-    const contentHash = MajikInvoice._sha256Hex(canonicalBytes);
+
+    // Only recompute the hash when the financial content has genuinely changed.
+    // Lifecycle mutations (status, payments, notes) must carry the existing hash
+    // forward so that attached signatures remain verifiable.
+    const contentHash = options.recomputeHash
+      ? MajikInvoice._sha256Hex(updatedInvoice.toCanonicalBytes())
+      : this.integrity.contentHash;
 
     let payload: MajikInvoicePayload;
 
@@ -2107,11 +2124,17 @@ export class MajikInvoice {
       invoice: updatedInvoice.toJSON(),
     };
 
+    // For lifecycle mutations (recomputeHash: false), preserve existing signatures.
+    // For financial edits (recomputeHash: true), drop signatures — content changed.
     const integrity: IntegrityBlock = {
       contentHash,
       hashAlgorithm: "SHA-256",
-      signatures: [],
-      isSealed: false,
+      signatures: options.recomputeHash ? [] : [...this.integrity.signatures],
+      isSealed: options.recomputeHash ? false : this.integrity.isSealed,
+      // Preserve allowlist metadata regardless
+      expectedSigners: this.integrity.expectedSigners,
+      allowlistSignerId: this.integrity.allowlistSignerId,
+      sealInfo: options.recomputeHash ? undefined : this.integrity.sealInfo,
     };
 
     return new MajikInvoice({
