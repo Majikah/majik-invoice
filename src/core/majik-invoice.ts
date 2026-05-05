@@ -150,6 +150,8 @@ export class MajikInvoice {
   readonly userId?: string;
   readonly accountId?: string;
 
+  recipients?: MajikMessagePublicKey[];
+
   // ── Public summary — always plaintext ────────────────────────────────────
   readonly public: PublicInvoiceSummary;
 
@@ -178,6 +180,7 @@ export class MajikInvoice {
     this.createdAt = opts.createdAt;
     this.updatedAt = opts.updatedAt;
     this._decrypted = opts.decrypted;
+    this.recipients = opts.recipients;
   }
 
   private rebuild(
@@ -1991,10 +1994,11 @@ export class MajikInvoice {
    */
   toMajikahInvoiceJSON(
     sender: MajikMessagePublicKey,
-    recipients: MajikMessagePublicKey[],
     options?: {
       userId?: string;
       accountId?: string;
+      recipients?: MajikMessagePublicKey[];
+      forceSignedOnly?: boolean;
     },
   ): MajikahInvoiceJSON {
     const finalUserId = options?.userId ?? this.userId;
@@ -2004,7 +2008,9 @@ export class MajikInvoice {
       );
     }
 
-    if (!recipients || recipients.length === 0) {
+    const finalRecipients = options?.recipients ?? this.recipients;
+
+    if (!finalRecipients || finalRecipients.length === 0) {
       throw new MajikInvoiceError(
         "At least 1 recipient is required to generate a MajikahInvoiceJSON.",
       );
@@ -2016,14 +2022,22 @@ export class MajikInvoice {
       );
     }
 
+    if (!this.isEncrypted && !options?.forceSignedOnly) {
+      throw new MajikInvoiceError(
+        "An encrypted invoice is required to generate a MajikahInvoiceJSON.",
+      );
+    }
+
     const finalAccountId = options?.accountId ?? this.accountId ?? finalUserId;
+
+    this.secureLock();
 
     const baseJSON = this.toJSON();
     return {
       ...baseJSON,
       user_id: finalUserId,
       account_id: finalAccountId,
-      recipients: recipients,
+      recipients: finalRecipients,
       public_key: sender,
       sent_at: new Date().toISOString(),
       status: this.public.status,
@@ -2057,6 +2071,7 @@ export class MajikInvoice {
         accountId: resolvedAccountId,
         createdAt: parsed.created_at,
         updatedAt: parsed.updated_at,
+        recipients: parsed?.recipients,
       });
 
       const validation = instance._validateStructure();

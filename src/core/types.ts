@@ -228,7 +228,7 @@ export interface MajikahInvoiceJSON extends MajikInvoiceJSON {
    * Used to deliver the invoice to the correct user(s) or org(s).
    *
    */
-  recipients: string[];
+  recipients: MajikMessagePublicKey[];
   /**
    * X25519 public key of the original invoice issuer.
    * Taken from `MajikKeyJSON.publicKey` — base64-encoded.
@@ -266,6 +266,7 @@ export interface MajikInvoiceConstructorOptions {
   createdAt: ISODateTimeString;
   updatedAt: ISODateTimeString;
   decrypted?: DecryptedCache;
+  recipients?: MajikMessagePublicKey[];
 }
 
 export interface DashboardStats {
