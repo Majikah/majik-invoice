@@ -2,7 +2,7 @@
   "name": "@majikah/majik-invoice",
   "type": "module",
   "description": "Domain model for post-quantum secured invoices — base GeneralInvoice with double-entry accounting projections, and MajikInvoice with hybrid Ed25519 + ML-DSA-87 signing and optional ML-KEM-768 encryption.",
-  "version": "0.0.19",
+  "version": "0.0.20",
   "license": "Apache-2.0",
   "author": "Zelijah",
   "main": "./dist/index.js",
@@ -54,8 +54,12 @@
     "@majikah/majik-envelope": "^0.0.4",
     "@majikah/majik-key": "^0.2.7",
     "@majikah/majik-signature": "^0.0.17",
+    "@noble/hashes": "^2.2.0",
     "@stablelib/sha256": "^2.0.1",
     "@thezelijah/majik-money": "^1.0.4",
     "uuid": "^14.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0"
   }
 }

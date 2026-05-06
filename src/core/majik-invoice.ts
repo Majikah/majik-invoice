@@ -30,7 +30,17 @@ import {
 } from "@majikah/majik-envelope";
 import type { MajikKey, MajikMessagePublicKey } from "@majikah/majik-key";
 
-import { hash } from "@stablelib/sha256";
+import {
+  encoder,
+  decoder,
+  sha256Hex,
+  canonicalBytesForSigning,
+} from "./crypto-utils";
+import {
+  assertKeyUnlocked,
+  assertKeyHasSigningKeys,
+  assertKeyHasMlKem,
+} from "./validators/key-guards";
 import {
   DashboardStats,
   DecryptedCache,
@@ -67,6 +77,13 @@ import {
   dedupeColumns,
   DEFAULT_CSV_COLUMNS,
 } from "./csv-export";
+import { computeAllowlistHash } from "./signing";
+import {
+  createSignatureJSON,
+  verifySignatureJSON,
+  computeSealHashAsync,
+} from "./signing-service";
+import { buildEncryptedPayload } from "./encryption";
 
 // ── Batch / stats types ───────────────────────────────────────────────────
 
@@ -239,7 +256,7 @@ export class MajikInvoice {
 
     // ── 3. Canonical bytes for signing/hashing ──────────────────────────────
     const canonicalBytes = generalInvoice.toCanonicalBytes();
-    const contentHash = MajikInvoice._sha256Hex(canonicalBytes);
+    const contentHash = sha256Hex(canonicalBytes);
 
     // ── 4. Build payload ────────────────────────────────────────────────────
     let payload: MajikInvoicePayload;
@@ -251,7 +268,7 @@ export class MajikInvoice {
         );
       }
 
-      payload = await MajikInvoice._buildEncryptedPayload(
+      payload = await buildEncryptedPayload(
         generalInvoice,
         recipients,
         input.signerKey,
@@ -433,7 +450,7 @@ export class MajikInvoice {
     }
 
     const generalInvoice = this._requirePlaintextInvoice("toEncrypted");
-    const payload = await MajikInvoice._buildEncryptedPayload(
+    const payload = await buildEncryptedPayload(
       generalInvoice,
       recipients,
       signerKey,
@@ -485,7 +502,7 @@ export class MajikInvoice {
 
     const generalInvoice = await this.decrypt(decryptKey);
     const canonicalBytes = generalInvoice.toCanonicalBytes();
-    const contentHash = MajikInvoice._sha256Hex(canonicalBytes);
+    const contentHash = sha256Hex(canonicalBytes);
 
     const now = new Date().toISOString();
     const payload: SignedOnlyPayload = {
@@ -681,8 +698,8 @@ export class MajikInvoice {
     }
 
     if (options.signerKey) {
-      MajikInvoice._assertKeyUnlocked(options.signerKey, "reissue");
-      MajikInvoice._assertKeyHasSigningKeys(options.signerKey, "reissue");
+      assertKeyUnlocked(options.signerKey, "reissue");
+      assertKeyHasSigningKeys(options.signerKey, "reissue");
     }
 
     let reissued: MajikInvoice;
@@ -691,10 +708,8 @@ export class MajikInvoice {
       // Encrypted path — must rebuild payload manually since _reissueFromMutation
       // cannot handle re-encryption without recipients context.
       const publicSummary = MajikInvoice._buildPublicSummary(updatedInvoice);
-      const contentHash = MajikInvoice._sha256Hex(
-        updatedInvoice.toCanonicalBytes(),
-      );
-      const payload = await MajikInvoice._buildEncryptedPayload(
+      const contentHash = sha256Hex(updatedInvoice.toCanonicalBytes());
+      const payload = await buildEncryptedPayload(
         updatedInvoice,
         options.recipients!,
       );
@@ -732,6 +747,226 @@ export class MajikInvoice {
     }
 
     return reissued;
+  }
+
+  /**
+   * Internal base for all recipient-side mutations.
+   *
+   * Handles both "signed-only" and "encrypted-and-signed" modes:
+   *
+   *   signed-only          → rebuilds payload via rebuild(), appends signature
+   *   encrypted-and-signed → re-encrypts with recipients, appends signature
+   *
+   * Invariants held across both modes:
+   *   - contentHash is always preserved (status / payment mutations are excluded
+   *     from toSignableJSON, so existing signatures remain cryptographically valid)
+   *   - expectedSigners, allowlistSignerId, sealInfo forwarded as-is
+   *   - existing signatures are preserved — only the recipient's sig is appended
+   *   - the issuer (allowlistSignerId) is never permitted to call this
+   *
+   * @internal — use receive() for the public encrypted-only contract
+   */
+  private async _receiveBase(
+    updatedInvoice: GeneralInvoice,
+    options: {
+      signerKey: MajikKey;
+      recipients?: MajikRecipient[];
+    },
+  ): Promise<MajikInvoice> {
+    const { signerKey, recipients } = options;
+
+    // ── 1. Key assertions ────────────────────────────────────────────────────
+    assertKeyUnlocked(signerKey, "receive");
+    assertKeyHasSigningKeys(signerKey, "receive");
+
+    // ── 2. Sealed invoices are immutable ─────────────────────────────────────
+    if (this.integrity.isSealed) {
+      throw new MajikInvoiceSealError(
+        "Cannot call receive() on a sealed invoice. Sealed invoices are immutable.",
+      );
+    }
+
+    // ── 3. Allowlist must exist ───────────────────────────────────────────────
+    if (
+      !this.integrity.expectedSigners ||
+      this.integrity.expectedSigners.length === 0
+    ) {
+      throw new MajikInvoiceSignatureError(
+        "receive() requires an expectedSigners allowlist. " +
+          "The issuer must establish the allowlist when creating the invoice.",
+      );
+    }
+
+    // ── 4. Issuer is never permitted — enforced regardless of mode ────────────
+    if (
+      this.integrity.allowlistSignerId &&
+      this.integrity.allowlistSignerId === signerKey.fingerprint
+    ) {
+      throw new MajikInvoiceSignatureError(
+        `receive(): key "${signerKey.fingerprint}" is the issuer of this invoice. ` +
+          "Issuers must use reissue() for mutations, not receive().",
+      );
+    }
+
+    // ── 5. Signer must be on the allowlist ───────────────────────────────────
+    const isAllowed = this.integrity.expectedSigners.some(
+      (es) => es.signerId === signerKey.fingerprint,
+    );
+    if (!isAllowed) {
+      throw new MajikInvoiceSignatureError(
+        `receive(): key "${signerKey.fingerprint}" is not on the allowlist for this invoice. ` +
+          `Allowed signers: [${this.integrity.expectedSigners.map((s) => s.signerId).join(", ")}].`,
+      );
+    }
+
+    // ── 6. Updated invoice must share the same id ────────────────────────────
+    if (updatedInvoice.id !== this.id) {
+      throw new MajikInvoiceError(
+        `receive(): updatedInvoice.id ("${updatedInvoice.id}") does not match ` +
+          `this invoice's id ("${this.id}"). You must mutate the same invoice.`,
+      );
+    }
+
+    // ── 7. Build the updated instance depending on mode ──────────────────────
+
+    let rebuilt: MajikInvoice;
+
+    if (this.mode === "encrypted-and-signed") {
+      // ML-KEM assertion only required for the encrypted path
+      assertKeyHasMlKem(signerKey, "receive");
+
+      if (!this.canDecrypt(signerKey)) {
+        throw new MajikInvoiceEncryptionError(
+          `receive(): key "${signerKey.fingerprint}" is not a recipient of this ` +
+            "invoice's encrypted envelope and cannot decrypt it.",
+        );
+      }
+
+      if (!recipients || recipients.length === 0) {
+        throw new MajikInvoiceKeyError(
+          "receive(): recipients are required for re-encryption on an " +
+            "encrypted-and-signed invoice.",
+        );
+      }
+
+      // Decrypt to validate access — the updatedInvoice was already mutated
+      // by the caller so we don't re-derive it here.
+      await this.decrypt(signerKey);
+
+      const newPayload = await buildEncryptedPayload(
+        updatedInvoice,
+        recipients,
+      );
+
+      const newPublic = MajikInvoice._buildPublicSummary(updatedInvoice);
+
+      // Rebuild integrity preserving everything from the issuer.
+      // contentHash is kept as-is — see invariant note on the method.
+      const newIntegrity: IntegrityBlock = {
+        contentHash: this.integrity.contentHash,
+        hashAlgorithm: this.integrity.hashAlgorithm,
+        signatures: [...this.integrity.signatures],
+        isSealed: this.integrity.isSealed,
+        expectedSigners: this.integrity.expectedSigners,
+        allowlistSignerId: this.integrity.allowlistSignerId,
+        sealInfo: this.integrity.sealInfo,
+      };
+
+      rebuilt = new (this.constructor as typeof MajikInvoice)({
+        id: this.id,
+        mode: "encrypted-and-signed",
+        userId: this.userId,
+        accountId: this.accountId,
+        public: newPublic,
+        payload: newPayload,
+        integrity: newIntegrity,
+        createdAt: this.createdAt,
+        updatedAt: new Date().toISOString(),
+        recipients: this.recipients,
+      } as MajikInvoiceConstructorOptions);
+    } else {
+      // signed-only path — rebuild() handles payload + public summary update.
+      // contentHash is preserved via recomputeHash: false.
+      // Existing signatures are preserved — we only drop signatures when
+      // recomputeHash is true, which is the issuer reissue() path.
+      rebuilt = this._reissueFromMutation(updatedInvoice, {
+        recomputeHash: false,
+      });
+    }
+
+    // ── 8. Append recipient signature ─────────────────────────────────────────
+    // sign() enforces allowlist membership (double-checked, but correct) and
+    // replaces any existing entry from this signer rather than duplicating.
+    // We do not pass expectedSigners — the allowlist is already on the rebuilt
+    // integrity block and sign() reads it from there.
+    return rebuilt.sign(signerKey);
+  }
+
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Recipient-side mutation for encrypted transport invoices.
+   *
+   * Strict public wrapper over _receiveBase() — requires recipients and
+   * enforces that the invoice is "encrypted-and-signed". This is the method
+   * used by MajikBuwizDatabase for all inbound invoice lifecycle actions.
+   *
+   * @param updatedInvoice          The mutated GeneralInvoice.
+   * @param options.signerKey       Unlocked MajikKey belonging to the recipient.
+   * @param options.recipients      Full participant list for re-encryption
+   *                                (all original recipients + issuer).
+   */
+  async receive(
+    updatedInvoice: GeneralInvoice,
+    options: {
+      signerKey: MajikKey;
+      recipients: MajikRecipient[];
+    },
+  ): Promise<MajikInvoice> {
+    if (this.mode !== "encrypted-and-signed") {
+      throw new MajikInvoiceError(
+        'receive() requires an "encrypted-and-signed" invoice. ' +
+          "Recipients never interact with plaintext invoices at the transport layer. " +
+          "For signed-only use cases call _receiveBase() directly.",
+      );
+    }
+
+    return this._receiveBase(updatedInvoice, options);
+  }
+
+  /**
+   * Recipient-side mutation for signed-only (plaintext) invoices.
+   *
+   * Public wrapper over _receiveBase() for local workflows where the invoice
+   * is held in plaintext — no encrypted envelope to re-wrap.
+   *
+   * Use receive() for all encrypted transport invoices (the cloud path).
+   * Use countersign() for local, offline, or tooling workflows where the
+   * invoice is signed-only.
+   *
+   * Enforces the same recipient invariants as receive():
+   *   - Invoice must be "signed-only"
+   *   - Invoice must not be sealed
+   *   - An expectedSigners allowlist must exist
+   *   - signerKey must be on that allowlist
+   *   - signerKey must NOT be the issuer (allowlistSignerId)
+   *   - signerKey must be unlocked and have signing keys
+   *
+   * @param updatedInvoice   The mutated GeneralInvoice.
+   * @param signerKey        Unlocked MajikKey belonging to the recipient.
+   */
+  async countersign(
+    updatedInvoice: GeneralInvoice,
+    signerKey: MajikKey,
+  ): Promise<MajikInvoice> {
+    if (this.mode !== "signed-only") {
+      throw new MajikInvoiceError(
+        'countersign() requires a "signed-only" invoice. ' +
+          "For encrypted-and-signed invoices use receive() instead.",
+      );
+    }
+
+    return this._receiveBase(updatedInvoice, { signerKey });
   }
 
   // ==========================================================================
@@ -850,8 +1085,8 @@ export class MajikInvoice {
       return this._decrypted.invoice;
     }
 
-    MajikInvoice._assertKeyUnlocked(key, "decrypt");
-    MajikInvoice._assertKeyHasMlKem(key, "decrypt");
+    assertKeyUnlocked(key, "decrypt");
+    assertKeyHasMlKem(key, "decrypt");
 
     const ep = this.payload as EncryptedPayload;
 
@@ -930,8 +1165,8 @@ export class MajikInvoice {
       timestamp?: string;
     },
   ): Promise<MajikInvoice> {
-    MajikInvoice._assertKeyUnlocked(key, "sign");
-    MajikInvoice._assertKeyHasSigningKeys(key, "sign");
+    assertKeyUnlocked(key, "sign");
+    assertKeyHasSigningKeys(key, "sign");
 
     if (this.integrity.isSealed) {
       throw new MajikInvoiceSealError(
@@ -956,7 +1191,7 @@ export class MajikInvoice {
     }
 
     // Compute canonical content for signing
-    const contentBytes = await MajikInvoice._canonicalBytesForSigning(
+    const contentBytes = await canonicalBytesForSigning(
       this.integrity.contentHash,
       this.id,
     );
@@ -966,22 +1201,11 @@ export class MajikInvoice {
     let allowlistHash: string | undefined;
     const signers = options?.expectedSigners ?? this.integrity.expectedSigners;
     if (signers && signers.length > 0) {
-      const canonicalAllowlist = JSON.stringify(
-        [...signers].sort((a, b) => a.signerId.localeCompare(b.signerId)),
-      );
-      const allowlistBytes = new TextEncoder().encode(canonicalAllowlist);
-      const hashBuffer = await crypto.subtle.digest("SHA-256", allowlistBytes);
-      // Encode as base64 to match MajikSignatureJSON.allowlistHash type (base64, 44 chars)
-      const hashArray = new Uint8Array(hashBuffer);
-      let binary = "";
-      for (let i = 0; i < hashArray.length; i++)
-        binary += String.fromCharCode(hashArray[i]);
-      allowlistHash = btoa(binary);
+      allowlistHash = computeAllowlistHash(signers);
     }
 
     try {
-      const sig = await MajikSignature.sign(contentBytes, key, {
-        contentType: "majik-invoice",
+      const sigJSON = await createSignatureJSON(contentBytes, key, {
         timestamp: options?.timestamp,
         allowlistHash,
       });
@@ -992,9 +1216,9 @@ export class MajikInvoice {
       );
       const newSignatures = [...this.integrity.signatures];
       if (existingIdx >= 0) {
-        newSignatures[existingIdx] = sig.toJSON();
+        newSignatures[existingIdx] = sigJSON;
       } else {
-        newSignatures.push(sig.toJSON());
+        newSignatures.push(sigJSON);
       }
 
       const newIntegrity: IntegrityBlock = {
@@ -1034,7 +1258,7 @@ export class MajikInvoice {
     key: MajikKey,
     options?: { timestamp?: string },
   ): Promise<MajikInvoice> {
-    MajikInvoice._assertKeyUnlocked(key, "seal");
+    assertKeyUnlocked(key, "seal");
 
     if (this.integrity.isSealed) {
       throw new MajikInvoiceSealError("Invoice is already sealed.");
@@ -1068,26 +1292,13 @@ export class MajikInvoice {
     }
 
     const sealTimestamp = options?.timestamp ?? new Date().toISOString();
-    const signerIds = this.integrity.signatures.map((s) => s.signerId);
 
-    // Compute the seal hash.
-    // MajikInvoice manages its own seal independent of MajikSignatureEmbed —
-    // we use SHA-256 via WebCrypto (universally available in both browser and
-    // Node/Workers). MajikSignatureEmbed uses SHA3-512 for file-level seals,
-    // but that algorithm is not in the WebCrypto standard and would require
-    // an external library here. The seal input covers all signerIds + the
-    // timestamp, so tampering with either breaks the hash.
-    const sealInput = JSON.stringify({
-      signerIds: signerIds.sort(),
+    // Compute the seal hash using full signatory info (ed/ml public keys)
+    // for stronger tamper-evidence. computeSealHashAsync uses SHA3-512.
+    const sealHash = await computeSealHashAsync(
+      this.integrity.signatures,
       sealTimestamp,
-    });
-    const sealHashBuffer = await crypto.subtle.digest(
-      "SHA-256",
-      new TextEncoder().encode(sealInput),
     );
-    const sealHash = Array.from(new Uint8Array(sealHashBuffer))
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("");
 
     // SealInfo shape matches @majikah/majik-signature — three fields only.
     const sealInfo: SealInfo = {
@@ -1122,7 +1333,7 @@ export class MajikInvoice {
       );
     }
 
-    const contentBytes = await MajikInvoice._canonicalBytesForSigning(
+    const contentBytes = await canonicalBytesForSigning(
       this.integrity.contentHash,
       this.id,
     );
@@ -1131,9 +1342,7 @@ export class MajikInvoice {
 
     for (const sigJSON of this.integrity.signatures) {
       try {
-        const sig = MajikSignature.fromJSON(sigJSON);
-        const publicKeys = sig.extractPublicKeys();
-        const result = MajikSignature.verify(contentBytes, sig, publicKeys);
+        const result = verifySignatureJSON(sigJSON, contentBytes);
         results.push(result);
       } catch (err) {
         results.push({
@@ -1165,7 +1374,7 @@ export class MajikInvoice {
       );
     }
 
-    const contentBytes = await MajikInvoice._canonicalBytesForSigning(
+    const contentBytes = await canonicalBytesForSigning(
       this.integrity.contentHash,
       this.id,
     );
@@ -1196,19 +1405,10 @@ export class MajikInvoice {
     }
 
     const info = this.integrity.sealInfo;
-    const signerIds = this.integrity.signatures.map((s) => s.signerId);
-
-    const sealInput = JSON.stringify({
-      signerIds: signerIds.sort(),
-      sealTimestamp: info.sealTimestamp,
-    });
-    const sealHashBuffer = await crypto.subtle.digest(
-      "SHA-256",
-      new TextEncoder().encode(sealInput),
+    const recomputedHash = await computeSealHashAsync(
+      this.integrity.signatures,
+      info.sealTimestamp,
     );
-    const recomputedHash = Array.from(new Uint8Array(sealHashBuffer))
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("");
 
     if (recomputedHash !== info.sealHash) {
       return {
@@ -2123,7 +2323,7 @@ export class MajikInvoice {
     // Lifecycle mutations (status, payments, notes) must carry the existing hash
     // forward so that attached signatures remain verifiable.
     const contentHash = options.recomputeHash
-      ? MajikInvoice._sha256Hex(updatedInvoice.toCanonicalBytes())
+      ? sha256Hex(updatedInvoice.toCanonicalBytes())
       : this.integrity.contentHash;
 
     let payload: MajikInvoicePayload;
@@ -2192,36 +2392,7 @@ export class MajikInvoice {
     recipients: MajikRecipient[],
     _signerKey?: MajikKey,
   ): Promise<EncryptedPayload> {
-    if (!recipients || recipients.length === 0) {
-      throw new MajikInvoiceKeyError(
-        "At least one recipient is required for encryption.",
-      );
-    }
-
-    const plaintext = JSON.stringify(invoice.toJSON());
-    const senderFingerprint =
-      recipients.length > 1 ? (recipients[0]?.fingerprint ?? "") : undefined;
-
-    try {
-      const envelope = await MajikEnvelope.encrypt({
-        plaintext,
-        recipients,
-        senderFingerprint,
-        compress: true,
-      });
-
-      return {
-        kind: "encrypted-and-signed",
-        envelopeString: envelope.toScannerString(),
-        algorithm: "ML-KEM-768 + AES-256-GCM",
-        recipientFingerprints: recipients.map((r) => r.fingerprint),
-      } satisfies EncryptedPayload;
-    } catch (err) {
-      throw new MajikInvoiceEncryptionError(
-        "Failed to encrypt invoice payload.",
-        err,
-      );
-    }
+    return buildEncryptedPayload(invoice, recipients, _signerKey);
   }
 
   /**
@@ -2229,24 +2400,7 @@ export class MajikInvoice {
    * Format: "majik-invoice-v1:" + JSON({ contentHash, id })
    * This ensures the signature covers both the invoice identity and its content hash.
    */
-  private static async _canonicalBytesForSigning(
-    contentHash: string,
-    invoiceId: string,
-  ): Promise<Uint8Array> {
-    const canonical = `majik-invoice-v1:${JSON.stringify({ contentHash, invoiceId })}`;
-    return new TextEncoder().encode(canonical);
-  }
-
-  /**
-   * Compute SHA-256 hex of bytes.
-   */
-  private static _sha256Hex(bytes: Uint8Array): string {
-    const hashed = hash(bytes);
-    const hexHash = Array.from(hashed)
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("");
-    return hexHash;
-  }
+  // canonicalBytesForSigning and sha256Hex are now provided by ./crypto-utils
   /**
    * Get the plaintext GeneralInvoice for operations that require it.
    * Handles signed-only mode and decrypted cache; throws if encrypted and not cached.
@@ -2265,37 +2419,7 @@ export class MajikInvoice {
         `Call decrypt(key) first.`,
     );
   }
-
-  // ── Key assertion helpers ─────────────────────────────────────────────────
-
-  private static _assertKeyUnlocked(key: MajikKey, operation: string): void {
-    if (key.isLocked) {
-      throw new MajikInvoiceKeyError(
-        `Cannot ${operation}: MajikKey is locked. Call key.unlock(passphrase) first.`,
-      );
-    }
-  }
-
-  private static _assertKeyHasSigningKeys(
-    key: MajikKey,
-    operation: string,
-  ): void {
-    if (!key.hasSigningKeys) {
-      throw new MajikInvoiceKeyError(
-        `Cannot ${operation}: MajikKey has no signing keys. ` +
-          `Re-import via key.importFromMnemonicBackup() to enable signing.`,
-      );
-    }
-  }
-
-  private static _assertKeyHasMlKem(key: MajikKey, operation: string): void {
-    if (!key.hasMlKem) {
-      throw new MajikInvoiceKeyError(
-        `Cannot ${operation}: MajikKey has no ML-KEM keys. ` +
-          `Re-import via key.importFromMnemonicBackup() to enable decryption.`,
-      );
-    }
-  }
+  // Key assertion helpers moved to ./validators/key-guards
 
   // ── Input validation ──────────────────────────────────────────────────────
 
@@ -2451,5 +2575,4 @@ export class MajikInvoice {
   }
 }
 
-const encoder = new TextEncoder();
-const decoder = new TextDecoder();
+// encoder/decoder moved to ./crypto-utils

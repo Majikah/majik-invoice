@@ -57,6 +57,7 @@ import {
   CSVResolveContext,
   DEFAULT_CSV_COLUMNS,
 } from "../csv-export";
+import { encoder, sha256Hex } from "../crypto-utils";
 
 export class GeneralInvoice {
   // ── Identity ──────────────────────────────────────────────────────────────
@@ -1644,15 +1645,30 @@ export class GeneralInvoice {
 
   // ── Update toCanonicalBytes() and toCanonicalJSON() ────────────────────────
 
+  private _canonicalBytes?: Uint8Array;
+  private _canonicalJSON?: string;
+  private _canonicalHash?: string;
+
   toCanonicalBytes(): Uint8Array {
+    if (this._canonicalBytes) return this._canonicalBytes;
     const json = this.toSignableJSON();
     const canonical = JSON.stringify(json, Object.keys(json).sort());
-    return new TextEncoder().encode(canonical);
+    this._canonicalJSON = canonical;
+    this._canonicalBytes = encoder.encode(canonical);
+    return this._canonicalBytes;
   }
 
   toCanonicalJSON(): string {
+    if (this._canonicalJSON) return this._canonicalJSON;
     const json = this.toSignableJSON();
-    return JSON.stringify(json, Object.keys(json).sort());
+    this._canonicalJSON = JSON.stringify(json, Object.keys(json).sort());
+    return this._canonicalJSON;
+  }
+
+  toCanonicalHash(): string {
+    if (this._canonicalHash) return this._canonicalHash;
+    this._canonicalHash = sha256Hex(this.toCanonicalBytes());
+    return this._canonicalHash;
   }
 
   // ==========================================================================
