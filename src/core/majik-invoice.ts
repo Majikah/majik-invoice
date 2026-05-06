@@ -214,6 +214,7 @@ export class MajikInvoice {
       createdAt: this.createdAt,
       updatedAt: new Date().toISOString(),
       decrypted: this._decrypted,
+      recipients: this.recipients,
       ...overrides,
     });
   }
