@@ -254,6 +254,25 @@ export class GeneralInvoice {
     );
   }
 
+  /**
+   * Restart a voided or otherwise terminal invoice back to draft.
+   *
+   * Preserves all financial data (line items, taxes, parties, dates,
+   * references, notes, tags, metadata) but:
+   *   - resets status to "draft"
+   *   - clears all proof-of-payments
+   *
+   * Unlike withStatus(), this bypasses ALLOWED_TRANSITIONS entirely,
+   * making it safe to call even on voided invoices.
+   */
+  restartInvoice(): GeneralInvoice {
+    return this.rebuild(
+      { status: "draft" },
+      undefined, // keep existing line items
+      [], // clear payments
+    );
+  }
+
   // ==========================================================================
   // ── WITH* MUTATION METHODS ─────────────────────────────────────────────────
   // ==========================================================================
@@ -422,29 +441,26 @@ export class GeneralInvoice {
 
   dispute(reason?: string): GeneralInvoice {
     const trimmedReason = reason?.trim();
-    if (!trimmedReason) return this.withStatus("disputed");
-
-    return this.withStatus("disputed")._appendNotes(
-      `DISPUTE REASON: ${trimmedReason}`,
-    );
+    const withReason = trimmedReason
+      ? this._appendNotes(`DISPUTE REASON: ${trimmedReason}`)
+      : this;
+    return withReason.withStatus("disputed");
   }
 
   resolveDispute(reason?: string): GeneralInvoice {
     const trimmedReason = reason?.trim();
-    if (!trimmedReason) return this.withStatus("issued");
-
-    return this.withStatus("issued")._appendNotes(
-      `RESOLUTION: ${trimmedReason}`,
-    );
+    const withReason = trimmedReason
+      ? this._appendNotes(`RESOLUTION: ${trimmedReason}`)
+      : this;
+    return withReason.withStatus("issued");
   }
 
   voidInvoice(reason?: string): GeneralInvoice {
     const trimmedReason = reason?.trim();
-    if (!trimmedReason) return this.withStatus("void");
-
-    return this.withStatus("void")._appendNotes(
-      `VOID REASON: ${trimmedReason}`,
-    );
+    const withReason = trimmedReason
+      ? this._appendNotes(`VOID REASON: ${trimmedReason}`)
+      : this;
+    return withReason.withStatus("void");
   }
   // ── Dates & terms (unchanged) ─────────────────────────────────────────────
 

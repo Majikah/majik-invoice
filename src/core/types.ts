@@ -177,6 +177,8 @@ export interface MajikInvoiceInput extends GeneralInvoiceInput {
    * Falls back to userId when calling toMajikahInvoiceJSON() if not provided.
    */
   accountId?: string;
+
+  recipientPublicKeys?: MajikMessagePublicKey[];
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +194,12 @@ export interface MajikInvoiceJSON {
   integrity: IntegrityBlock;
   created_at: ISODateTimeString;
   updated_at: ISODateTimeString;
+  /**
+   * Recipient Public Key identifiers for cloud routing.
+   * Used to deliver the invoice to the correct user(s) or org(s).
+   *
+   */
+  recipients: MajikMessagePublicKey[];
 }
 
 // ---------------------------------------------------------------------------
@@ -223,12 +231,7 @@ export interface MajikahInvoiceJSON extends MajikInvoiceJSON {
    * Falls back to user_id if not explicitly provided.
    */
   account_id: string;
-  /**
-   * Recipient Public Key identifiers for cloud routing.
-   * Used to deliver the invoice to the correct user(s) or org(s).
-   *
-   */
-  recipients: MajikMessagePublicKey[];
+
   /**
    * X25519 public key of the original invoice issuer.
    * Taken from `MajikKeyJSON.publicKey` — base64-encoded.

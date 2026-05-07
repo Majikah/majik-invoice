@@ -106,6 +106,13 @@ export interface OverdueMarkResult {
   }>;
 }
 
+// ── batchDuplicate ────────────────────────────────────────────────────────
+
+export interface BatchDuplicateResult {
+  duplicated: MajikInvoice[];
+  errors: Array<{ invoiceId: string; reason: string }>;
+}
+
 // ---------------------------------------------------------------------------
 // Schema version
 // ---------------------------------------------------------------------------
@@ -185,7 +192,7 @@ export class MajikInvoice {
   // ── Runtime-only decrypted cache (NOT persisted) ──────────────────────────
   private _decrypted?: DecryptedCache;
 
-  private constructor(opts: MajikInvoiceConstructorOptions) {
+  protected constructor(opts: MajikInvoiceConstructorOptions) {
     this.version = MAJIK_INVOICE_SCHEMA_VERSION;
     this.id = opts.id;
     this.mode = opts.mode;
@@ -248,6 +255,7 @@ export class MajikInvoice {
       expectedSigners,
       userId,
       accountId,
+      recipientPublicKeys,
       ...generalInput
     } = input;
     const generalInvoice = GeneralInvoice.create(generalInput);
@@ -300,6 +308,7 @@ export class MajikInvoice {
       integrity,
       createdAt: now,
       updatedAt: now,
+      recipients: recipientPublicKeys,
     });
 
     // ── 6. Sign immediately if signerKey provided ────────────────────────────
@@ -311,6 +320,60 @@ export class MajikInvoice {
     }
 
     return instance;
+  }
+
+  // ── restartInvoice ────────────────────────────────────────────────────────
+
+  /**
+   * Restart this invoice to draft status, clearing all payments.
+   * Preserves all financial data, parties, line items, taxes, and metadata.
+   *
+   * Bypasses lifecycle transition guards — works even on voided invoices.
+   *
+   * For encrypted invoices, decryptKey is required to access the inner
+   * GeneralInvoice. The result is always returned as "signed-only" unless
+   * you re-encrypt via toEncrypted() afterwards.
+   *
+   * All existing signatures and the seal are cleared — re-sign after restart.
+   *
+   * @throws {MajikInvoiceError}           if encrypted and no decryptKey provided
+   * @throws {MajikInvoiceKeyError}        if decryptKey is locked or missing ML-KEM key
+   * @throws {MajikInvoiceEncryptionError} if decryption fails
+   */
+  async restartInvoice(decryptKey?: MajikKey): Promise<MajikInvoice> {
+    let gi: GeneralInvoice;
+
+    if (this.mode === "encrypted-and-signed") {
+      if (!decryptKey) {
+        throw new MajikInvoiceError(
+          "restartInvoice(): decryptKey is required for encrypted-and-signed invoices.",
+        );
+      }
+      gi = await this.decrypt(decryptKey);
+    } else {
+      gi = this._requirePlaintextInvoice("restartInvoice");
+    }
+
+    const restarted = gi.restartInvoice();
+
+    // Recompute hash: false — financial content is unchanged.
+    // But we explicitly clear signatures since this is an intentional
+    // operational reset (status + payments changed).
+    const updated = this._reissueFromMutation(restarted, {
+      recomputeHash: false,
+    });
+
+    // Manually strip signatures/seal from the rebuilt instance.
+    // _reissueFromMutation with recomputeHash:false preserves them,
+    // but a restart must be re-signed from scratch.
+    const clearedIntegrity: IntegrityBlock = {
+      ...updated.integrity,
+      signatures: [],
+      isSealed: false,
+      sealInfo: undefined,
+    };
+
+    return updated.rebuild({ integrity: clearedIntegrity });
   }
 
   // ==========================================================================
@@ -442,6 +505,7 @@ export class MajikInvoice {
    */
   async toEncrypted(
     recipients: MajikRecipient[],
+    recipientPublicKeys?: MajikMessagePublicKey[],
     signerKey?: MajikKey,
   ): Promise<MajikInvoice> {
     if (this.mode === "encrypted-and-signed") {
@@ -475,6 +539,7 @@ export class MajikInvoice {
       integrity,
       createdAt: this.createdAt,
       updatedAt: now,
+      recipients: recipientPublicKeys,
     });
 
     if (signerKey) {
@@ -688,6 +753,7 @@ export class MajikInvoice {
       signerKey?: MajikKey;
       recipients?: MajikRecipient[];
       expectedSigners?: ExpectedSigner[];
+      recipientPublicKeys?: MajikMessagePublicKey[];
     } = {},
   ): Promise<MajikInvoice> {
     if (this.mode === "encrypted-and-signed") {
@@ -706,6 +772,14 @@ export class MajikInvoice {
     let reissued: MajikInvoice;
 
     if (this.mode === "encrypted-and-signed") {
+      if (
+        !options?.recipientPublicKeys ||
+        options.recipientPublicKeys.length === 0
+      ) {
+        throw new MajikInvoiceKeyError(
+          "recipientPublicKeys are required to reissue an encrypted-and-signed invoice.",
+        );
+      }
       // Encrypted path — must rebuild payload manually since _reissueFromMutation
       // cannot handle re-encryption without recipients context.
       const publicSummary = MajikInvoice._buildPublicSummary(updatedInvoice);
@@ -730,7 +804,7 @@ export class MajikInvoice {
         integrity,
         createdAt: this.createdAt,
         updatedAt: new Date().toISOString(),
-        recipients: this.recipients,
+        recipients: options.recipientPublicKeys || this.recipients,
         userId: this.userId,
         accountId: this.accountId,
       });
@@ -1001,6 +1075,7 @@ export class MajikInvoice {
       /** Optional — re-signs the converted invoice immediately */
       signerKey?: MajikKey;
       expectedSigners?: ExpectedSigner[];
+      recipientPublicKeys?: MajikMessagePublicKey[];
     } = {},
   ): Promise<MajikInvoice> {
     if (this.mode === targetMode) {
@@ -1015,7 +1090,20 @@ export class MajikInvoice {
           `recipients are required when converting to "encrypted-and-signed" mode.`,
         );
       }
-      return this.toEncrypted(options.recipients, options.signerKey);
+
+      if (
+        !options.recipientPublicKeys ||
+        options.recipientPublicKeys.length === 0
+      ) {
+        throw new MajikInvoiceKeyError(
+          `recipientPublicKeys are required when converting to "encrypted-and-signed" mode.`,
+        );
+      }
+      return this.toEncrypted(
+        options.recipients,
+        options.recipientPublicKeys,
+        options.signerKey,
+      );
     }
 
     // targetMode === "signed-only"
@@ -1028,7 +1116,6 @@ export class MajikInvoice {
       return this.toSignedOnly(options.decryptKey, options.signerKey);
     }
 
-    // Unreachable given the two-value union, but keeps TS happy
     throw new MajikInvoiceError(`Unrecognised target mode "${targetMode}".`);
   }
 
@@ -2189,6 +2276,7 @@ export class MajikInvoice {
       integrity: { ...this.integrity },
       created_at: this.createdAt,
       updated_at: this.updatedAt,
+      recipients: this.recipients || [],
     };
   }
 
@@ -2577,6 +2665,115 @@ export class MajikInvoice {
       errors,
     };
   }
-}
 
-// encoder/decoder moved to ./crypto-utils
+  // ── duplicate ─────────────────────────────────────────────────────────────
+
+  /**
+   * Duplicate this invoice, assigning a new UUID and resetting it to draft.
+   *
+   * The duplicate is always returned as an unsigned "signed-only" invoice —
+   * no signatures, no seal, no payments. All financial data (line items, taxes,
+   * parties, dates, references, notes, tags, metadata) is preserved.
+   *
+   * For encrypted invoices, decryptKey is required to access the inner
+   * GeneralInvoice. The duplicate is always "signed-only" — re-encrypt via
+   * toEncrypted() if needed.
+   *
+   * @throws {MajikInvoiceError}           if encrypted and no decryptKey provided
+   * @throws {MajikInvoiceKeyError}        if decryptKey is locked or missing ML-KEM key
+   * @throws {MajikInvoiceEncryptionError} if decryption fails
+   */
+  async duplicate(decryptKey?: MajikKey): Promise<MajikInvoice> {
+    let gi: GeneralInvoice;
+
+    if (this.mode === "encrypted-and-signed") {
+      if (this.isLocked) {
+        if (!decryptKey) {
+          throw new MajikInvoiceError(
+            "duplicate(): decryptKey is required for encrypted-and-signed invoices.",
+          );
+        }
+        gi = await this.decrypt(decryptKey);
+      } else {
+        gi = this.invoice;
+      }
+    } else {
+      gi = this._requirePlaintextInvoice("duplicate");
+    }
+
+    // Build a fresh GeneralInvoice with a new id, status draft, no payments
+    const baseInput = gi.toMajikInvoiceInput();
+    const clonedGi = GeneralInvoice.create({
+      ...baseInput,
+      id: undefined, // generateUUID() picks a new id inside create()
+      status: "draft",
+    });
+
+    const publicSummary = MajikInvoice._buildPublicSummary(clonedGi);
+    const contentHash = sha256Hex(clonedGi.toCanonicalBytes());
+    const now = new Date().toISOString();
+
+    const payload: SignedOnlyPayload = {
+      kind: "signed-only",
+      invoice: clonedGi.toJSON(),
+    };
+
+    const integrity: IntegrityBlock = {
+      contentHash,
+      hashAlgorithm: "SHA-256",
+      signatures: [],
+      isSealed: false,
+    };
+
+    return new MajikInvoice({
+      id: clonedGi.id,
+      mode: "signed-only" as MajikInvoiceMode,
+      public: publicSummary,
+      payload,
+      integrity,
+      createdAt: now,
+      updatedAt: now,
+    });
+  }
+
+  /**
+   * Duplicate an array of MajikInvoice instances concurrently.
+   *
+   * Signed-only invoices are duplicated directly.
+   * Encrypted invoices require decryptKey — those without a usable key are
+   * collected in the errors array and excluded from duplicated.
+   *
+   * Each duplicate receives a new UUID, draft status, and no payments/signatures.
+   *
+   * @param invoices   - Invoices to duplicate
+   * @param decryptKey - Optional unlocked key for decrypting encrypted invoices
+   */
+  static async batchDuplicate(
+    invoices: MajikInvoice[],
+    decryptKey?: MajikKey,
+  ): Promise<BatchDuplicateResult> {
+    const errors: BatchDuplicateResult["errors"] = [];
+
+    const results = await Promise.allSettled(
+      invoices.map((inv) => inv.duplicate(decryptKey)),
+    );
+
+    const duplicated: MajikInvoice[] = [];
+
+    results.forEach((result, i) => {
+      if (result.status === "fulfilled") {
+        duplicated.push(result.value);
+      } else {
+        errors.push({
+          invoiceId: invoices[i].id,
+          reason:
+            result.reason instanceof Error
+              ? result.reason.message
+              : String(result.reason),
+        });
+      }
+    });
+
+    return { duplicated, errors };
+  }
+}
