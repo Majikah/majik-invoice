@@ -722,7 +722,7 @@ export class MajikInvoice {
         expectedSigners: this.integrity.expectedSigners,
         allowlistSignerId: this.integrity.allowlistSignerId,
       };
-      reissued = new MajikInvoice({
+      reissued = this.rebuild({
         id: updatedInvoice.id,
         mode: this.mode,
         public: publicSummary,
@@ -730,6 +730,9 @@ export class MajikInvoice {
         integrity,
         createdAt: this.createdAt,
         updatedAt: new Date().toISOString(),
+        recipients: this.recipients,
+        userId: this.userId,
+        accountId: this.accountId,
       });
     } else {
       // Signed-only path — delegate to _reissueFromMutation with hash recompute.

@@ -425,7 +425,7 @@ export class GeneralInvoice {
     if (!trimmedReason) return this.withStatus("disputed");
 
     return this.withStatus("disputed")._appendNotes(
-      `VOID REASON: ${trimmedReason}`,
+      `DISPUTE REASON: ${trimmedReason}`,
     );
   }
 
@@ -434,7 +434,7 @@ export class GeneralInvoice {
     if (!trimmedReason) return this.withStatus("issued");
 
     return this.withStatus("issued")._appendNotes(
-      `VOID REASON: ${trimmedReason}`,
+      `RESOLUTION: ${trimmedReason}`,
     );
   }
 
@@ -967,6 +967,22 @@ export class GeneralInvoice {
   // ── GETTERS ─────────────────────────────────────────────────────────────────
   // ==========================================================================
 
+  get isDisputed(): boolean {
+    return this.status === "disputed";
+  }
+
+  get isVoided(): boolean {
+    return this.status === "void";
+  }
+
+  get isSent(): boolean {
+    return this.status === "sent";
+  }
+
+  get isViewed(): boolean {
+    return this.status === "viewed";
+  }
+
   get formattedTotal(): string {
     return this.totals.grandTotal.format();
   }
@@ -1021,7 +1037,14 @@ export class GeneralInvoice {
 
   get isOverdue(): boolean {
     if (!this.dueDate) return false;
+    if (["void", "paid", "disputed"].includes(this.status)) return false;
+    const totalPaid = this.proofOfPayments.reduce((s, p) => s + p.amount, 0);
+    if (totalPaid >= this.totals.netPayableAmount) return false;
     return new Date().toISOString().slice(0, 10) > this.dueDate;
+  }
+
+  get effectiveStatus(): InvoiceStatus {
+    return this.isOverdue ? "overdue" : this.status;
   }
 
   /** All unique tax types across all line items (additive + withholding) */
@@ -1087,7 +1110,7 @@ export class GeneralInvoice {
   }
 
   get amountDue(): MajikMoney {
-    return this.totals.grandTotal.subtract(this.totalPaid);
+    return this.totals.netPayable.subtract(this.totalPaid);
   }
 
   get isFullyPaid(): boolean {
@@ -1161,7 +1184,7 @@ export class GeneralInvoice {
     const updated = this.rebuild({}, undefined, sorted);
 
     const paid = updated.totalPaid;
-    const total = updated.totals.grandTotal;
+    const total = updated.totals.netPayable;
     const due = updated.amountDue;
 
     // ── Prevent overpayment ────────────────────
