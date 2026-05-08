@@ -270,6 +270,7 @@ export interface MajikInvoiceConstructorOptions {
   updatedAt: ISODateTimeString;
   decrypted?: DecryptedCache;
   recipients?: MajikMessagePublicKey[];
+  sentAt?: ISODateTimeString;
 }
 
 export interface DashboardStats {

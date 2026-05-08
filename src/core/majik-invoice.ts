@@ -193,6 +193,7 @@ export class MajikInvoice {
   // ── Timestamps ────────────────────────────────────────────────────────────
   readonly createdAt: string;
   readonly updatedAt: string;
+  readonly sentAt?: string;
 
   // ── Runtime-only decrypted cache (NOT persisted) ──────────────────────────
   private _decrypted?: DecryptedCache;
@@ -210,6 +211,7 @@ export class MajikInvoice {
     this.updatedAt = opts.updatedAt;
     this._decrypted = opts.decrypted;
     this.recipients = opts.recipients;
+    this.sentAt = opts.sentAt;
   }
 
   private rebuild(
@@ -227,6 +229,7 @@ export class MajikInvoice {
       updatedAt: new Date().toISOString(),
       decrypted: this._decrypted,
       recipients: this.recipients,
+      sentAt: this.sentAt,
       ...overrides,
     });
   }
@@ -314,6 +317,7 @@ export class MajikInvoice {
       createdAt: now,
       updatedAt: now,
       recipients: recipientPublicKeys,
+      sentAt: undefined,
     });
 
     // ── 6. Sign immediately if signerKey provided ────────────────────────────
@@ -550,6 +554,7 @@ export class MajikInvoice {
       createdAt: this.createdAt,
       updatedAt: now,
       recipients: recipientPublicKeys,
+      sentAt: this.sentAt,
     });
 
     if (signerKey) {
@@ -603,6 +608,7 @@ export class MajikInvoice {
       integrity,
       createdAt: this.createdAt,
       updatedAt: now,
+      sentAt: this.sentAt,
     });
 
     this.secureLock();
@@ -2207,7 +2213,7 @@ export class MajikInvoice {
     buffer[4] = MJKI_VERSION;
 
     // ── Reserved flags (future use) ───────
-    buffer[5] = 0;
+    buffer[5] = this.isEncrypted ? 1 : 0;
     buffer[6] = 0;
     buffer[7] = 0;
 
@@ -2378,6 +2384,7 @@ export class MajikInvoice {
         createdAt: parsed.created_at,
         updatedAt: parsed.updated_at,
         recipients: parsed?.recipients,
+        sentAt: parsed?.sent_at,
       });
 
       const validation = instance._validateStructure();
@@ -2466,6 +2473,7 @@ export class MajikInvoice {
       integrity,
       createdAt: this.createdAt,
       updatedAt: new Date().toISOString(),
+      sentAt: this.sentAt,
     });
   }
 
@@ -2755,6 +2763,7 @@ export class MajikInvoice {
       integrity,
       createdAt: now,
       updatedAt: now,
+      sentAt: undefined,
     });
   }
 
@@ -2797,5 +2806,41 @@ export class MajikInvoice {
     });
 
     return { duplicated, errors };
+  }
+
+  /**
+   * Checks if this.sentAt is a valid date.
+   */
+  public hasValidSentAt(): boolean {
+    if (!this.sentAt) return false;
+
+    const date = new Date(this.sentAt);
+
+    return !Number.isNaN(date.getTime());
+  }
+
+  /**
+   * Returns true if sentAt exists, is valid,
+   * and is older than the specified number of days.
+   *
+   * Example:
+   *   isPastDeletionWindow(30)
+   *   -> true if sentAt is more than 30 days ago
+   */
+  public isPastDeletionWindow(days: number): boolean {
+    if (!this.hasValidSentAt()) return false;
+
+    const sentDate = new Date(this.sentAt!);
+    const now = new Date();
+
+    const diffMs = now.getTime() - sentDate.getTime();
+
+    const diffDays = diffMs / (1000 * 60 * 60 * 24);
+
+    return diffDays > days;
+  }
+
+  get sentDate(): Date {
+    return this.hasValidSentAt() ? new Date(this.sentAt!) : this.issueDate;
   }
 }
