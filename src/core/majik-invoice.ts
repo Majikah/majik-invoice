@@ -54,7 +54,6 @@ import {
   MajikInvoicePayload,
   MajikInvoiceStatus,
   MajikInvoiceValidationResult,
-  MajikUserID,
   PublicInvoiceSummary,
   SignedOnlyPayload,
 } from "./types";
@@ -111,6 +110,11 @@ export interface OverdueMarkResult {
 export interface BatchDuplicateResult {
   duplicated: MajikInvoice[];
   errors: Array<{ invoiceId: string; reason: string }>;
+}
+
+export interface InvoiceDecryptionResult {
+  invoice: GeneralInvoice;
+  instance: MajikInvoice;
 }
 
 // ---------------------------------------------------------------------------
@@ -349,7 +353,8 @@ export class MajikInvoice {
           "restartInvoice(): decryptKey is required for encrypted-and-signed invoices.",
         );
       }
-      gi = await this.decrypt(decryptKey);
+      const decryptedResult = await this.decrypt(decryptKey);
+      gi = decryptedResult.invoice;
     } else {
       gi = this._requirePlaintextInvoice("restartInvoice");
     }
@@ -566,18 +571,18 @@ export class MajikInvoice {
       throw new MajikInvoiceError("Invoice is already in 'signed-only' mode.");
     }
 
-    const generalInvoice = await this.decrypt(decryptKey);
-    const canonicalBytes = generalInvoice.toCanonicalBytes();
+    const { invoice } = await this.decrypt(decryptKey);
+    const canonicalBytes = invoice.toCanonicalBytes();
     const contentHash = sha256Hex(canonicalBytes);
 
     const now = new Date().toISOString();
     const payload: SignedOnlyPayload = {
       kind: "signed-only",
-      invoice: generalInvoice.toJSON(),
+      invoice: invoice.toJSON(),
     };
 
     const integrity: IntegrityBlock = {
-      contentHash: this.integrity.contentHash,
+      contentHash: contentHash || this.integrity.contentHash,
       hashAlgorithm: "SHA-256",
       signatures: [],
       isSealed: false,
@@ -1155,6 +1160,20 @@ export class MajikInvoice {
   // ── ENCRYPTION & DECRYPTION ────────────────────────────────────────────────
   // ==========================================================================
 
+  // 2. withDecryptedCache — clean way to stamp cache onto a new instance
+  withDecryptedCache(
+    invoice: GeneralInvoice,
+    decryptedBy: string,
+  ): MajikInvoice {
+    return this.rebuild({
+      decrypted: {
+        invoice,
+        decryptedAt: new Date().toISOString(),
+        decryptedBy,
+      },
+    });
+  }
+
   /**
    * Decrypt an encrypted invoice using the recipient's MajikKey.
    * Result is cached on the instance for subsequent `.invoice` access.
@@ -1164,7 +1183,7 @@ export class MajikInvoice {
    * @throws {MajikInvoiceKeyError} if key is locked or has no ML-KEM secret key
    * @throws {MajikInvoiceEncryptionError} if decryption fails (wrong key or corrupted data)
    */
-  async decrypt(key: MajikKey): Promise<GeneralInvoice> {
+  async decrypt(key: MajikKey): Promise<InvoiceDecryptionResult> {
     if (this.mode === "signed-only") {
       throw new MajikInvoiceError(
         "Invoice is not encrypted (mode: 'signed-only'). Access .invoice directly.",
@@ -1173,7 +1192,10 @@ export class MajikInvoice {
 
     // Return cached result if the same key decrypted this session
     if (this._decrypted && this._decrypted.decryptedBy === key.fingerprint) {
-      return this._decrypted.invoice;
+      return {
+        instance: this,
+        invoice: this._decrypted.invoice,
+      };
     }
 
     assertKeyUnlocked(key, "decrypt");
@@ -1193,14 +1215,8 @@ export class MajikInvoice {
       const generalInvoiceJSON: GeneralInvoiceJSON = JSON.parse(plaintext);
       const generalInvoice = GeneralInvoice.fromJSON(generalInvoiceJSON);
 
-      // Cache the result
-      this._decrypted = {
-        invoice: generalInvoice,
-        decryptedAt: new Date().toISOString(),
-        decryptedBy: key.fingerprint,
-      };
-
-      return generalInvoice;
+      const stamped = this.withDecryptedCache(generalInvoice, key.fingerprint);
+      return { invoice: generalInvoice, instance: stamped };
     } catch (err) {
       if (err instanceof MajikInvoiceError) throw err;
       throw new MajikInvoiceEncryptionError(
@@ -1769,22 +1785,15 @@ export class MajikInvoice {
 
     const results = await Promise.allSettled(
       invoices.map(async (inv) => {
-        // Signed-only: nothing to decrypt, pass through
         if (inv.mode === "signed-only") return inv;
-
-        // Already decrypted this session — skip redundant work
         if (inv.hasDecryptedCache) return inv;
-
-        // Authorisation pre-check — avoids expensive crypto on wrong key
         if (!inv.canDecrypt(key)) {
           throw new Error(
             `Key "${key.fingerprint}" is not a recipient of this invoice.`,
           );
         }
-
-        // Decrypt — caches result on the instance
-        await inv.decrypt(key);
-        return inv;
+        const { instance } = await inv.decrypt(key);
+        return instance; // ← was: return inv (original, no cache)
       }),
     );
 
@@ -1886,8 +1895,8 @@ export class MajikInvoice {
           continue;
         }
         try {
-          await inv.decrypt(decryptKey);
-          gi = inv.invoice;
+          const { invoice } = await inv.decrypt(decryptKey);
+          gi = invoice;
         } catch (error) {
           if (strict) throw error;
           skipped.push({ invoiceId: inv.id, reason: "encrypted" });
@@ -2693,7 +2702,9 @@ export class MajikInvoice {
             "duplicate(): decryptKey is required for encrypted-and-signed invoices.",
           );
         }
-        gi = await this.decrypt(decryptKey);
+        const decryptedResult = await this.decrypt(decryptKey);
+
+        gi = decryptedResult.invoice;
       } else {
         gi = this.invoice;
       }
