@@ -83,6 +83,7 @@ import {
   computeSealHashAsync,
 } from "./signing-service";
 import { buildEncryptedPayload } from "./encryption";
+import { incrementLastNumericSequence } from "./general-invoice/utils";
 
 // ── Batch / stats types ───────────────────────────────────────────────────
 
@@ -347,7 +348,9 @@ export class MajikInvoice {
   async restartInvoice(decryptKey?: MajikKey): Promise<MajikInvoice> {
     let gi: GeneralInvoice;
 
-    if (this.mode === "encrypted-and-signed") {
+    let finalInvoice: MajikInvoice = this;
+
+    if (this.isEncrypted) {
       if (!decryptKey) {
         throw new MajikInvoiceError(
           "restartInvoice(): decryptKey is required for encrypted-and-signed invoices.",
@@ -355,6 +358,8 @@ export class MajikInvoice {
       }
       const decryptedResult = await this.decrypt(decryptKey);
       gi = decryptedResult.invoice;
+      finalInvoice = decryptedResult.instance;
+      finalInvoice = await finalInvoice.toSignedOnly(decryptKey, decryptKey);
     } else {
       gi = this._requirePlaintextInvoice("restartInvoice");
     }
@@ -364,7 +369,7 @@ export class MajikInvoice {
     // Recompute hash: false — financial content is unchanged.
     // But we explicitly clear signatures since this is an intentional
     // operational reset (status + payments changed).
-    const updated = this._reissueFromMutation(restarted, {
+    finalInvoice = finalInvoice._reissueFromMutation(restarted, {
       recomputeHash: false,
     });
 
@@ -372,13 +377,13 @@ export class MajikInvoice {
     // _reissueFromMutation with recomputeHash:false preserves them,
     // but a restart must be re-signed from scratch.
     const clearedIntegrity: IntegrityBlock = {
-      ...updated.integrity,
+      ...finalInvoice.integrity,
       signatures: [],
       isSealed: false,
       sealInfo: undefined,
     };
 
-    return updated.rebuild({ integrity: clearedIntegrity });
+    return finalInvoice.rebuild({ integrity: clearedIntegrity });
   }
 
   // ==========================================================================
@@ -2714,10 +2719,16 @@ export class MajikInvoice {
 
     // Build a fresh GeneralInvoice with a new id, status draft, no payments
     const baseInput = gi.toMajikInvoiceInput();
+
+    const incrementedInvoiceNumber = !!baseInput.invoiceNumber?.trim()
+      ? incrementLastNumericSequence(baseInput.invoiceNumber)
+      : undefined;
+
     const clonedGi = GeneralInvoice.create({
       ...baseInput,
       id: undefined, // generateUUID() picks a new id inside create()
       status: "draft",
+      invoiceNumber: incrementedInvoiceNumber,
     });
 
     const publicSummary = MajikInvoice._buildPublicSummary(clonedGi);

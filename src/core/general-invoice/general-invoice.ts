@@ -293,10 +293,10 @@ export class GeneralInvoice {
     return this.rebuild({ invoiceNumber: invoiceNumber.trim() });
   }
 
-  withStatus(status: InvoiceStatus): GeneralInvoice {
+  withStatus(status: InvoiceStatus, force: boolean = false): GeneralInvoice {
     if (this.status === status) return this;
     const allowed = ALLOWED_TRANSITIONS[this.status];
-    if (!allowed.includes(status)) {
+    if (!allowed.includes(status) && !force) {
       throw new InvoiceLifecycleError(
         `Invalid status transition: "${this.status}" → "${status}". ` +
           `Allowed from "${this.status}": [${allowed.join(", ") || "none"}].`,
@@ -1210,11 +1210,11 @@ export class GeneralInvoice {
 
     // ── Resolve status ─────────────────────────
     if (due.isZero()) {
-      return updated.withStatus("paid");
+      return updated.withStatus("paid", true);
     }
 
     if (paid.greaterThan(MajikMoney.zero(this.currency))) {
-      return updated.withStatus("partial");
+      return updated.withStatus("partial", true);
     }
 
     // fallback: unpaid state
