@@ -512,21 +512,73 @@ export class MajikInvoice {
   /**
    * Convert a signed-only MajikInvoice to an encrypted-and-signed one.
    * Returns a NEW MajikInvoice. The original is untouched.
-   * The new instance carries no signatures — re-sign after conversion.
    *
-   * @throws {MajikInvoiceError} if already encrypted
-   * @throws {MajikInvoiceKeyError} if recipientKeys are locked or missing
+   * ---
+   *
+   * **Signature behaviour** (`options.dropSignatures`, default: `false`):
+   *
+   * - `false` — existing signatures are carried over. The converted invoice
+   *   retains its cryptographic history; the allowlist and seal are preserved as-is.
+   *   Use this for pure mode conversion where the signing chain must remain intact.
+   *
+   * - `true`  — all signatures, the seal, and sealInfo are cleared. The converted
+   *   invoice is unsigned and must be re-signed from scratch. Use this when the
+   *   issuer is reissuing or restarting the invoice lifecycle.
+   *
+   * ---
+   *
+   * **Allowlist override** (`options.expectedSigners`):
+   *
+   * Only valid when `dropSignatures: true`. Each carried-over signature embeds its
+   * own `allowlistHash` — replacing the allowlist while preserving signatures would
+   * create a mismatch against those embedded hashes. Passing `expectedSigners`
+   * with `dropSignatures: false` throws.
+   *
+   * ---
+   *
+   * **Auto-sign** (`signerKey`):
+   *
+   * If provided, the converted invoice is signed immediately. If the key is already
+   * present in the carried-over signature set (`dropSignatures: false`), the sign
+   * step is skipped — the existing entry is authoritative.
+   *
+   * @param recipients              Recipient list for the ML-KEM envelope.
+   * @param recipientPublicKeys     Optional public key strings for cloud routing.
+   * @param signerKey               Optional. If provided, signs the converted invoice immediately.
+   * @param options.dropSignatures  Clear all signatures and seal (default: `false`).
+   * @param options.expectedSigners Override the allowlist. Requires `dropSignatures: true`.
+   *
+   * @throws {MajikInvoiceError}           if already encrypted
+   * @throws {MajikInvoiceError}           if expectedSigners is set without dropSignatures: true
+   * @throws {MajikInvoiceKeyError}        if recipientKeys are locked or missing
+   * @throws {MajikInvoiceEncryptionError} if encryption fails
    */
   async toEncrypted(
     recipients: MajikRecipient[],
     recipientPublicKeys?: MajikMessagePublicKey[],
     signerKey?: MajikKey,
+    options?: { dropSignatures?: boolean; expectedSigners?: ExpectedSigner[] },
   ): Promise<MajikInvoice> {
     if (this.mode === "encrypted-and-signed") {
       throw new MajikInvoiceError(
         "Invoice is already in 'encrypted-and-signed' mode.",
       );
     }
+
+    const dropSignatures = options?.dropSignatures ?? false;
+
+    // Allowlist override is only valid when dropping signatures.
+    // When preserving signatures, each carries its own allowlistHash — replacing
+    // the expectedSigners list would create a mismatch against those embedded hashes.
+    if (options?.expectedSigners && !dropSignatures) {
+      throw new MajikInvoiceError(
+        "toEncrypted(): expectedSigners override requires dropSignatures: true. " +
+          "Existing signatures embed their own allowlistHash and cannot be rebound to a new allowlist.",
+      );
+    }
+
+    const expectedSigners =
+      options?.expectedSigners ?? this.integrity.expectedSigners;
 
     const generalInvoice = this._requirePlaintextInvoice("toEncrypted");
     const payload = await buildEncryptedPayload(
@@ -539,10 +591,11 @@ export class MajikInvoice {
     const integrity: IntegrityBlock = {
       contentHash: this.integrity.contentHash,
       hashAlgorithm: "SHA-256",
-      signatures: [],
-      isSealed: false,
-      expectedSigners: this.integrity.expectedSigners,
+      signatures: dropSignatures ? [] : [...this.integrity.signatures],
+      isSealed: dropSignatures ? false : this.integrity.isSealed,
+      expectedSigners,
       allowlistSignerId: this.integrity.allowlistSignerId,
+      ...(dropSignatures ? {} : { sealInfo: this.integrity.sealInfo }),
     };
 
     const converted = new MajikInvoice({
@@ -558,24 +611,64 @@ export class MajikInvoice {
     });
 
     if (signerKey) {
-      return converted.sign(signerKey);
+      // Key already carried over from the preserved signature set — no-op.
+      // Calling sign() again would just overwrite the same entry, which is
+      // harmless but redundant. Skip it.
+      if (converted.hasSigned(signerKey)) return converted;
+
+      return converted.sign(signerKey, { expectedSigners });
     }
     return converted;
   }
 
   /**
    * Convert an encrypted-and-signed MajikInvoice to a signed-only (plaintext) one.
-   * The decrypting key must be provided to access the inner GeneralInvoice.
    * Returns a NEW MajikInvoice. The original is untouched.
-   * Signatures are cleared — re-sign after conversion.
    *
-   * @throws {MajikInvoiceError} if already signed-only
-   * @throws {MajikInvoiceKeyError} if decryptKey is locked
+   * ---
+   *
+   * **Signature behaviour** (`options.dropSignatures`, default: `false`):
+   *
+   * - `false` — existing signatures are carried over. The converted invoice
+   *   retains its cryptographic history; the allowlist and seal are preserved as-is.
+   *   Use this for pure mode conversion (e.g. converting for a local/offline workflow)
+   *   where the signing chain must remain intact.
+   *
+   * - `true`  — all signatures, the seal, and sealInfo are cleared. The converted
+   *   invoice is unsigned and must be re-signed from scratch. Use this when the
+   *   issuer is reissuing or restarting the invoice lifecycle.
+   *
+   * ---
+   *
+   * **Allowlist override** (`options.expectedSigners`):
+   *
+   * Only valid when `dropSignatures: true`. Each carried-over signature embeds its
+   * own `allowlistHash` — replacing the allowlist while preserving signatures would
+   * create a mismatch against those embedded hashes. Passing `expectedSigners`
+   * with `dropSignatures: false` throws.
+   *
+   * ---
+   *
+   * **Auto-sign** (`signerKey`):
+   *
+   * If provided, the converted invoice is signed immediately. If the key is already
+   * present in the carried-over signature set (`dropSignatures: false`), the sign
+   * step is skipped — the existing entry is authoritative.
+   *
+   * @param decryptKey       Unlocked MajikKey used to decrypt the envelope.
+   * @param signerKey        Optional. If provided, signs the converted invoice immediately.
+   * @param options.dropSignatures  Clear all signatures and seal (default: `false`).
+   * @param options.expectedSigners Override the allowlist. Requires `dropSignatures: true`.
+   *
+   * @throws {MajikInvoiceError}           if already signed-only
+   * @throws {MajikInvoiceError}           if expectedSigners is set without dropSignatures: true
+   * @throws {MajikInvoiceKeyError}        if decryptKey is locked or missing ML-KEM key
    * @throws {MajikInvoiceEncryptionError} if decryption fails
    */
   async toSignedOnly(
     decryptKey: MajikKey,
     signerKey?: MajikKey,
+    options?: { dropSignatures?: boolean; expectedSigners?: ExpectedSigner[] },
   ): Promise<MajikInvoice> {
     if (this.mode === "signed-only") {
       throw new MajikInvoiceError("Invoice is already in 'signed-only' mode.");
@@ -591,13 +684,28 @@ export class MajikInvoice {
       invoice: invoice.toJSON(),
     };
 
+    const dropSignatures = options?.dropSignatures ?? false;
+    // Allowlist override is only valid when dropping signatures.
+    // When preserving signatures, each carries its own allowlistHash — replacing
+    // the expectedSigners list would create a mismatch against those embedded hashes.
+    if (options?.expectedSigners && !dropSignatures) {
+      throw new MajikInvoiceError(
+        "toSignedOnly(): expectedSigners override requires dropSignatures: true. " +
+          "Existing signatures embed their own allowlistHash and cannot be rebound to a new allowlist.",
+      );
+    }
+
+    const expectedSigners =
+      options?.expectedSigners ?? this.integrity.expectedSigners;
+
     const integrity: IntegrityBlock = {
-      contentHash: contentHash || this.integrity.contentHash,
+      contentHash: contentHash,
       hashAlgorithm: "SHA-256",
-      signatures: [],
-      isSealed: false,
-      expectedSigners: this.integrity.expectedSigners,
+      signatures: dropSignatures ? [] : [...this.integrity.signatures],
+      isSealed: dropSignatures ? false : this.integrity.isSealed,
+      expectedSigners: expectedSigners,
       allowlistSignerId: this.integrity.allowlistSignerId,
+      ...(dropSignatures ? {} : { sealInfo: this.integrity.sealInfo }),
     };
 
     const converted = new MajikInvoice({
@@ -614,7 +722,12 @@ export class MajikInvoice {
     this.secureLock();
 
     if (signerKey) {
-      return converted.sign(signerKey);
+      // Key already carried over from the preserved signature set — no-op.
+      // Calling sign() again would just overwrite the same entry, which is
+      // harmless but redundant. Skip it.
+      if (converted.hasSigned(signerKey)) return converted;
+
+      return converted.sign(signerKey, { expectedSigners: expectedSigners });
     }
     return converted;
   }
