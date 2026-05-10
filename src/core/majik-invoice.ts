@@ -2748,6 +2748,7 @@ export class MajikInvoice {
    *
    *   signed-only              → full data row using the GeneralInvoice
    *   encrypted + decrypted    → full data row using the cached GeneralInvoice
+   *   encrypted + decryptKey   → attempts decryption using provided key
    *   encrypted + locked       → partial row using only PublicInvoiceSummary
    *                              fields; all GeneralInvoice-only columns are
    *                              left blank. The invoice IS still included in
@@ -2758,10 +2759,13 @@ export class MajikInvoice {
     invoices: MajikInvoice[],
     options: {
       columns?: CSVColumn[];
+      decryptKey?: MajikKey;
     } = {},
   ): Promise<CSVExportResult> {
     const rawColumns = options.columns ?? DEFAULT_CSV_COLUMNS;
     const columns = dedupeColumns(rawColumns);
+
+    const uniqueInvoices = dedupeInvoices(invoices);
 
     const partialExports: CSVExportResult["partialExports"] = [];
     const errors: CSVExportResult["errors"] = [];
@@ -2770,7 +2774,7 @@ export class MajikInvoice {
     // Header row — always present even if there are zero invoices
     rows.push(buildCSVHeader(columns));
 
-    for (const inv of invoices) {
+    for (const inv of uniqueInvoices) {
       try {
         // ── Resolve the GeneralInvoice (or fall back to public summary) ────────
         let generalInvoice: GeneralInvoice | undefined;
@@ -2781,21 +2785,28 @@ export class MajikInvoice {
         } else if (inv.hasDecryptedCache) {
           // Encrypted but already decrypted this session
           generalInvoice = inv.invoice;
-        } else {
-          // Encrypted and locked — we cannot access GeneralInvoice fields.
-          // Export what we can from the public summary and note the gap.
-          generalInvoice = undefined;
+        } else if (options.decryptKey) {
+          // Try explicit decrypt key first
+          try {
+            const result = await inv.decrypt(options.decryptKey);
+            generalInvoice = result.invoice;
+          } catch {
+            // Ignore decrypt failure and fall through
+            generalInvoice = undefined;
+          }
+        }
 
-          // Identify which columns will be blank so we can report them
+        // ── Still unavailable → partial export ────────────────────────────────
+        if (!generalInvoice) {
           const unavailable = columns
             .filter((col) => {
-              // Probe: try resolving with no invoice; blank result = unavailable
               try {
                 const ctx: CSVResolveContext = {
                   invoice: undefined,
                   public: inv.public,
                   invoiceId: inv.id,
                 };
+
                 const val = col.resolve(ctx);
                 return val === "";
               } catch {
@@ -2806,7 +2817,10 @@ export class MajikInvoice {
 
           partialExports.push({
             invoiceId: inv.id,
-            reason: "encrypted-no-cache",
+            reason:
+              inv.mode === "encrypted-and-signed"
+                ? "encrypted-no-cache"
+                : "invoice-unavailable",
             unavailableColumns: unavailable,
           });
         }
@@ -2995,4 +3009,18 @@ export class MajikInvoice {
   get sentDate(): Date {
     return this.hasValidSentAt() ? new Date(this.sentAt!) : this.issueDate;
   }
+}
+
+/**
+ * Remove duplicate invoices by invoice id while preserving order.
+ * First occurrence wins.
+ */
+export function dedupeInvoices(invoices: MajikInvoice[]): MajikInvoice[] {
+  const seen = new Set<string>();
+
+  return invoices.filter((inv) => {
+    if (seen.has(inv.id)) return false;
+    seen.add(inv.id);
+    return true;
+  });
 }

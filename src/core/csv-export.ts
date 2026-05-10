@@ -42,7 +42,7 @@ export interface CSVExportResult {
   /** Invoices that were exported but with limited (public-only) data */
   partialExports: Array<{
     invoiceId: string;
-    reason: "encrypted-no-cache";
+    reason: "encrypted-no-cache" | "invoice-unavailable";
     /** Column keys that could not be resolved and were left blank */
     unavailableColumns: string[];
   }>;
