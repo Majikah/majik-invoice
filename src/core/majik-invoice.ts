@@ -13,6 +13,7 @@
 import { GeneralInvoice } from "./general-invoice";
 import type {
   GeneralInvoiceJSON,
+  InvoiceStatus,
   PaymentStatus,
   ProofOfPayment,
 } from "./general-invoice";
@@ -363,7 +364,9 @@ export class MajikInvoice {
       const decryptedResult = await this.decrypt(decryptKey);
       gi = decryptedResult.invoice;
       finalInvoice = decryptedResult.instance;
-      finalInvoice = await finalInvoice.toSignedOnly(decryptKey, decryptKey);
+      finalInvoice = await finalInvoice.toSignedOnly(decryptKey, decryptKey, {
+        dropSignatures: true,
+      });
     } else {
       gi = this._requirePlaintextInvoice("restartInvoice");
     }
@@ -745,7 +748,7 @@ export class MajikInvoice {
    * "unsigned"        — invoice created but no signatures attached yet
    * "invalid"         — structural or cryptographic verification failed
    */
-  get status(): MajikInvoiceStatus {
+  get integrityStatus(): MajikInvoiceStatus {
     try {
       const structValid = this._validateStructure();
       if (!structValid.valid) return "invalid";
@@ -768,21 +771,47 @@ export class MajikInvoice {
     return "partially-signed";
   }
 
-  get displayStatus(): string {
-    if (this.status === "invalid") return "Invalid";
-    if (this.status === "unsigned") return "Unsigned";
+  /**
+   * Current business/lifecycle status of the invoice.
+   *
+   * Represents the operational state of the invoice within
+   * the billing and payment workflow.
+   *
+   * Possible values:
+   *
+   * - "draft"    — invoice is still being prepared
+   * - "issued"   — invoice has been finalized and issued
+   * - "sent"     — invoice has been delivered to recipients
+   * - "viewed"   — invoice has been opened by the recipient
+   * - "partial"  — invoice has received a partial payment
+   * - "paid"     — invoice has been fully settled
+   * - "overdue"  — payment due date has passed unpaid
+   * - "void"     — invoice has been cancelled/voided
+   * - "disputed" — invoice has an active dispute
+   *
+   * This is the primary business-facing invoice status and
+   * should not be confused with `integrityStatus`, which
+   * describes the cryptographic/signature posture of the invoice.
+   */
+  get status(): InvoiceStatus {
+    return this.isLocked ? this.public.status : this.invoice.status;
+  }
 
-    if (this.status === "partially-signed") {
+  get displayStatus(): string {
+    if (this.integrityStatus === "invalid") return "Invalid";
+    if (this.integrityStatus === "unsigned") return "Unsigned";
+
+    if (this.integrityStatus === "partially-signed") {
       return this.isEncrypted
         ? "Partially Signed (Encrypted)"
         : "Partially Signed";
     }
 
-    if (this.status === "fully-signed") {
+    if (this.integrityStatus === "fully-signed") {
       return this.isEncrypted ? "Fully Signed (Encrypted)" : "Fully Signed";
     }
 
-    if (this.status === "sealed") {
+    if (this.integrityStatus === "sealed") {
       return this.isEncrypted ? "Sealed (Encrypted)" : "Sealed";
     }
 
@@ -1205,6 +1234,7 @@ export class MajikInvoice {
       signerKey?: MajikKey;
       expectedSigners?: ExpectedSigner[];
       recipientPublicKeys?: MajikMessagePublicKey[];
+      dropSignatures?: boolean;
     } = {},
   ): Promise<MajikInvoice> {
     if (this.mode === targetMode) {
@@ -1212,6 +1242,8 @@ export class MajikInvoice {
         `Invoice is already in "${targetMode}" mode.`,
       );
     }
+
+    const dropSignatures = options.dropSignatures ?? false;
 
     if (targetMode === "encrypted-and-signed") {
       if (!options.recipients || options.recipients.length === 0) {
@@ -1232,6 +1264,10 @@ export class MajikInvoice {
         options.recipients,
         options.recipientPublicKeys,
         options.signerKey,
+        {
+          dropSignatures: dropSignatures,
+          expectedSigners: dropSignatures ? options.expectedSigners : undefined,
+        },
       );
     }
 
@@ -1242,7 +1278,10 @@ export class MajikInvoice {
           `decryptKey is required when converting from "encrypted-and-signed" to "signed-only".`,
         );
       }
-      return this.toSignedOnly(options.decryptKey, options.signerKey);
+      return this.toSignedOnly(options.decryptKey, options.signerKey, {
+        dropSignatures: dropSignatures,
+        expectedSigners: dropSignatures ? options.expectedSigners : undefined,
+      });
     }
 
     throw new MajikInvoiceError(`Unrecognised target mode "${targetMode}".`);
@@ -2149,7 +2188,7 @@ export class MajikInvoice {
       }
       if (invStatus === "draft") draftCount++;
       if (invStatus === "void") voidCount++;
-      if (inv.status === "unsigned") unsignedCount++;
+      if (inv.integrityStatus === "unsigned") unsignedCount++;
       if (inv.isEncrypted && !inv.hasDecryptedCache) encryptedCount++;
 
       // ── Temporal ─────────────────────────────────────────────────────────────
