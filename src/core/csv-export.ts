@@ -127,22 +127,35 @@ export interface CSVResolveContext {
 // CSV escape helper
 // ---------------------------------------------------------------------------
 
+export interface CSVEscapeOptions {
+  preserveNewlines?: boolean;
+}
+
 /** RFC 4180 — wrap in quotes and escape internal quotes by doubling them */
-function esc(value: string): string {
+function esc(value: unknown, options?: CSVEscapeOptions): string {
   if (value == null) return "";
 
   let str = String(value);
 
-  // Prevent CSV injection (Excel)
-  if (/^[=+\-@]/.test(str)) {
+  // normalize line endings
+  str = str.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+
+  // remove null bytes
+  str = str.replace(/\0/g, "");
+
+  // flatten multiline content for CSV compatibility
+  if (!options?.preserveNewlines) {
+    str = str.replace(/\n{2,}/g, " || ");
+    str = str.replace(/\n/g, " ");
+  }
+
+  // prevent excel injection
+  if (/^\s*[=+\-@]/.test(str)) {
     str = `'${str}`;
   }
 
   const needsQuotes =
-    str.includes(",") ||
-    str.includes('"') ||
-    str.includes("\n") ||
-    str.includes("\r");
+    str.includes(",") || str.includes('"') || str.includes("\n");
 
   if (needsQuotes) {
     return `"${str.replace(/"/g, '""')}"`;
@@ -150,7 +163,6 @@ function esc(value: string): string {
 
   return str;
 }
-
 // ---------------------------------------------------------------------------
 // Column definitions
 // ---------------------------------------------------------------------------
