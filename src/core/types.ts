@@ -328,3 +328,8 @@ export interface DashboardStats {
   /** count of invoices whose dueDate is within the next N days (default 7) */
   dueSoonCount: number;
 }
+
+export interface InvoiceSignature {
+  hash: string;
+  signature: MajikSignatureJSON;
+}

@@ -611,6 +611,9 @@ export class MajikInvoice {
       updatedAt: now,
       recipients: recipientPublicKeys,
       sentAt: this.sentAt,
+      accountId: this.accountId,
+      decrypted: this._decrypted,
+      userId: this.userId,
     });
 
     if (signerKey) {
@@ -720,6 +723,10 @@ export class MajikInvoice {
       createdAt: this.createdAt,
       updatedAt: now,
       sentAt: this.sentAt,
+      accountId: this.accountId,
+      decrypted: this._decrypted,
+      recipients: this.recipients,
+      userId: this.userId,
     });
 
     this.secureLock();
