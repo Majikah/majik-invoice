@@ -43,10 +43,12 @@ import {
   assertKeyHasMlKem,
 } from "./validators/key-guards";
 import {
+  ConflictResolutionStrategy,
   DashboardStats,
   DecryptedCache,
   EncryptedPayload,
   IntegrityBlock,
+  InvoiceDiff,
   MajikahInvoiceJSON,
   MajikInvoiceConstructorOptions,
   MajikInvoiceInput,
@@ -105,6 +107,21 @@ export interface OverdueMarkResult {
     invoiceId: string;
     reason: "encrypted" | "not-overdue" | "wrong-status";
   }>;
+}
+// ── Sync types ────────────────────────────────────────────────────────────
+
+export interface BatchSyncStatusResult {
+  synced: MajikInvoice[];
+  conflicts: SyncConflict[];
+  localOnly: MajikInvoice[];
+  remoteOnly: MajikInvoice[];
+}
+
+export interface SyncConflict {
+  id: string;
+  local: MajikInvoice;
+  remote: MajikInvoice;
+  diff: InvoiceDiff;
 }
 
 // ── batchDuplicate ────────────────────────────────────────────────────────
@@ -877,6 +894,10 @@ export class MajikInvoice {
   /** Decrypted cache metadata (who decrypted, when). */
   get decryptedCache(): DecryptedCache | undefined {
     return this._decrypted;
+  }
+
+  get hash(): string {
+    return this.integrity.contentHash;
   }
 
   /**
@@ -2170,8 +2191,18 @@ export class MajikInvoice {
     let newestDate: string | null = null;
 
     for (const inv of invoices) {
+      // ── Detailed financials — only available when plaintext is accessible ────
+      let gi: GeneralInvoice | null = null;
+      try {
+        if (inv.mode === "signed-only" || inv.hasDecryptedCache) {
+          gi = inv.invoice;
+        }
+      } catch {
+        gi = null;
+      }
+
       const pub = inv.public;
-      const invStatus = pub.status ?? "draft";
+      const invStatus = gi ? gi.effectiveStatus : (pub.status ?? "draft");
       const invAmount = pub.totalAmount ?? 0;
 
       // ── Status buckets ──────────────────────────────────────────────────────
@@ -2208,16 +2239,6 @@ export class MajikInvoice {
       const dueDate = pub.dueDate?.slice(0, 10) ?? null;
       if (dueDate && dueDate >= today && dueDate <= dueSoonCutoff) {
         dueSoonCount++;
-      }
-
-      // ── Detailed financials — only available when plaintext is accessible ────
-      let gi: GeneralInvoice | null = null;
-      try {
-        if (inv.mode === "signed-only" || inv.hasDecryptedCache) {
-          gi = inv.invoice;
-        }
-      } catch {
-        gi = null;
       }
 
       // ── Relationships ────────────────────────────────────────────────────────
@@ -3015,6 +3036,206 @@ export class MajikInvoice {
 
   get sentDate(): Date {
     return this.hasValidSentAt() ? new Date(this.sentAt!) : this.issueDate;
+  }
+
+  isIssuer(key: MajikKey): boolean {
+    if (!key || !key?.fingerprint) {
+      throw new MajikInvoiceKeyError(
+        "A valid Majik Key with fingerprint is required for this method.",
+      );
+    }
+    if (this.signatureCount <= 0) return false;
+
+    const initSigner = this.signerIds[0];
+    return initSigner === key.fingerprint;
+  }
+
+  /**
+   * SYNCING METHODS
+   */
+
+  // ── 1. Content equality (hash only) ──────────────────────────────────────
+
+  /**
+   * Returns true if both invoices have the same content hash.
+   * Does NOT check id, invoice number, mode, or any other field.
+   * Use this to detect whether financial content has changed between two copies.
+   */
+  static isSameContent(a: MajikInvoice, b: MajikInvoice): boolean {
+    return a.integrity.contentHash === b.integrity.contentHash;
+  }
+
+  // ── 2. Full sync equality (id + invoice number + hash) ───────────────────
+
+  /**
+   * Returns true if two invoices represent the same document and
+   * neither side has diverged — same id, same invoice number, and same
+   * content hash.
+   *
+   * Use this as the "skip sync" guard: if isSynced returns true, the
+   * local and remote copies are identical and no transfer is needed.
+   */
+  static isSynced(a: MajikInvoice, b: MajikInvoice): boolean {
+    if (a.id !== b.id) return false;
+    if (a.public.invoiceNumber !== b.public.invoiceNumber) return false;
+    return MajikInvoice.isSameContent(a, b);
+  }
+
+  // ── 3. Latest by updatedAt ────────────────────────────────────────────────
+
+  /**
+   * Returns the invoice with the later updatedAt timestamp.
+   * If both timestamps are identical, `a` is returned (first argument wins).
+   *
+   * Use this when you've already determined a conflict exists and simply
+   * want the newest copy. For full conflict resolution with strategy options,
+   * use resolveConflict().
+   */
+  static latest(a: MajikInvoice, b: MajikInvoice): MajikInvoice {
+    const tA = new Date(a.updatedAt).getTime();
+    const tB = new Date(b.updatedAt).getTime();
+    return tB > tA ? b : a;
+  }
+
+  // ── 4. Structured diff ────────────────────────────────────────────────────
+
+  /**
+   * Returns a structured diff between two invoice instances.
+   * Both invoices should share the same id for a diff to be meaningful,
+   * but this is not enforced — cross-id diffs are valid for fingerprinting.
+   *
+   * updatedAtDeltaMs is (a.updatedAt - b.updatedAt):
+   *   positive → a is newer
+   *   negative → b is newer (remote is ahead)
+   *   zero     → identical timestamps
+   */
+  static diff(a: MajikInvoice, b: MajikInvoice): InvoiceDiff {
+    return {
+      sameContent: MajikInvoice.isSameContent(a, b),
+      sameInvoiceNumber: a.public.invoiceNumber === b.public.invoiceNumber,
+      sameMode: a.mode === b.mode,
+      sameStatus: a.public.status === b.public.status,
+      updatedAtDeltaMs:
+        new Date(a.updatedAt).getTime() - new Date(b.updatedAt).getTime(),
+      contentHashChanged: a.integrity.contentHash !== b.integrity.contentHash,
+    };
+  }
+
+  // ── 5. Batch sync status ──────────────────────────────────────────────────
+
+  /**
+   * Compare a local array against a remote array and classify every invoice.
+   *
+   * Classification rules (matched by id):
+   *   synced     — same id, same hash (isSynced returns true)
+   *   conflict   — same id, different hash (both sides have diverged)
+   *   localOnly  — id found only in local array (needs upload)
+   *   remoteOnly — id found only in remote array (needs download)
+   *
+   * Conflicts include a full InvoiceDiff so you can decide whether to
+   * auto-resolve or surface them to the user.
+   */
+  static batchSyncStatus(
+    local: MajikInvoice[],
+    remote: MajikInvoice[],
+  ): BatchSyncStatusResult {
+    const remoteMap = new Map(remote.map((inv) => [inv.id, inv]));
+    const localMap = new Map(local.map((inv) => [inv.id, inv]));
+
+    const synced: MajikInvoice[] = [];
+    const conflicts: SyncConflict[] = [];
+    const localOnly: MajikInvoice[] = [];
+    const remoteOnly: MajikInvoice[] = [];
+
+    for (const localInv of local) {
+      const remoteInv = remoteMap.get(localInv.id);
+
+      if (!remoteInv) {
+        localOnly.push(localInv);
+        continue;
+      }
+
+      if (MajikInvoice.isSameContent(localInv, remoteInv)) {
+        synced.push(localInv);
+      } else {
+        conflicts.push({
+          id: localInv.id,
+          local: localInv,
+          remote: remoteInv,
+          diff: MajikInvoice.diff(localInv, remoteInv),
+        });
+      }
+    }
+
+    for (const remoteInv of remote) {
+      if (!localMap.has(remoteInv.id)) {
+        remoteOnly.push(remoteInv);
+      }
+    }
+
+    return { synced, conflicts, localOnly, remoteOnly };
+  }
+
+  // ── 6. Conflict resolution ────────────────────────────────────────────────
+
+  /**
+   * Resolve a conflict between a local and remote copy of the same invoice.
+   *
+   * Strategies:
+   *   "latest-wins" — winner is the copy with the later updatedAt (default)
+   *   "local-wins"  — always prefer the local copy
+   *   "remote-wins" — always prefer the remote copy
+   *
+   * Returns { winner, loser, strategy } so the caller knows which direction
+   * to push and can log the outcome.
+   *
+   * @throws {MajikInvoiceError} if local.id !== remote.id
+   */
+  static resolveConflict(
+    local: MajikInvoice,
+    remote: MajikInvoice,
+    strategy: ConflictResolutionStrategy = "latest-wins",
+  ): {
+    winner: MajikInvoice;
+    loser: MajikInvoice;
+    strategy: ConflictResolutionStrategy;
+  } {
+    if (local.id !== remote.id) {
+      throw new MajikInvoiceError(
+        `resolveConflict(): local.id ("${local.id}") and remote.id ("${remote.id}") ` +
+          "must match. You cannot resolve a conflict between two different invoices.",
+      );
+    }
+
+    let winner: MajikInvoice;
+    let loser: MajikInvoice;
+
+    switch (strategy) {
+      case "local-wins":
+        winner = local;
+        loser = remote;
+        break;
+      case "remote-wins":
+        winner = remote;
+        loser = local;
+        break;
+      case "latest-wins":
+      default: {
+        const tLocal = new Date(local.updatedAt).getTime();
+        const tRemote = new Date(remote.updatedAt).getTime();
+        if (tRemote > tLocal) {
+          winner = remote;
+          loser = local;
+        } else {
+          // Tie also goes to local — local is the source of truth when equal.
+          winner = local;
+          loser = remote;
+        }
+        break;
+      }
+    }
+
+    return { winner, loser, strategy };
   }
 }
 

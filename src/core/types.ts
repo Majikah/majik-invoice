@@ -333,3 +333,23 @@ export interface InvoiceSignature {
   hash: string;
   signature: MajikSignatureJSON;
 }
+
+// ── Sync types ────────────────────────────────────────────────────────────
+
+export type SyncStatus = "synced" | "conflict" | "local-only" | "remote-only";
+export type ConflictResolutionStrategy =
+  | "latest-wins"
+  | "local-wins"
+  | "remote-wins";
+
+
+export interface InvoiceDiff {
+  sameContent: boolean;
+  sameInvoiceNumber: boolean;
+  sameMode: boolean;
+  sameStatus: boolean;
+  /** Positive = local is newer, negative = remote is newer, 0 = same. */
+  updatedAtDeltaMs: number;
+  contentHashChanged: boolean;
+}
+
