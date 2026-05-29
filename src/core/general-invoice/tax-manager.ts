@@ -1,14 +1,10 @@
-
-
 import type { TaxDetail, TaxBehaviour } from "./types";
 import { InvoiceValidationError } from "./errors";
-
-
 
 /**
  * Tax Manager
  * ---
- * 
+ *
  * @description Immutable collection of TaxDetail entries with named operations.
  *
  * Responsibilities:
@@ -182,6 +178,31 @@ export class TaxManager {
 
   toArray(): TaxDetail[] {
     return [...this._taxes];
+  }
+
+  /**
+   * First additive VAT tax.
+   * Useful for PH VAT invoices where only one VAT is expected.
+   */
+  get vat(): TaxDetail | undefined {
+    return this._taxes.find((t) => {
+      const type = t.taxType.trim().toLowerCase();
+      const behaviour = t.behaviour ?? "additive";
+
+      return type.includes("vat") && behaviour === "additive";
+    });
+  }
+
+  /**
+   * First EWT withholding tax.
+   * Useful for PH BIR withholding workflows.
+   */
+  get ewt(): TaxDetail | undefined {
+    return this._taxes.find((t) => {
+      const type = t.taxType.trim().toLowerCase();
+
+      return type.includes("ewt") && t.behaviour === "withholding";
+    });
   }
 
   // ── Validation (static — also used by LineItem and GeneralInvoice) ─────────
