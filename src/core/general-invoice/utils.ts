@@ -28,12 +28,9 @@ export function resolveTaxes(input: LineItemInput): TaxManager {
   return TaxManager.none();
 }
 
-
-
 // ---------------------------------------------------------------------------
 // Internal helper — Utilities for working with invoice-like alphanumeric identifiers.
 // ---------------------------------------------------------------------------
-
 
 /**
  * invoice-number.utils.ts
@@ -185,4 +182,28 @@ export function incrementLastNumericSequence(value: string): string {
   const incremented = incrementNumericString(range.value);
 
   return value.slice(0, range.start) + incremented + value.slice(range.end);
+}
+
+export function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => canonicalize(item));
+  }
+
+  if (value !== null && typeof value === "object") {
+    const object = value as Record<string, unknown>;
+
+    return Object.keys(object)
+      .sort()
+      .reduce<Record<string, unknown>>((result, key) => {
+        const current = object[key];
+
+        if (current !== undefined) {
+          result[key] = canonicalize(current);
+        }
+
+        return result;
+      }, {});
+  }
+
+  return value;
 }

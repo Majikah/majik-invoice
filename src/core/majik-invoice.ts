@@ -29,7 +29,7 @@ import {
   type MajikRecipient,
   type MajikIdentity,
 } from "@majikah/majik-envelope";
-import type { MajikKey, MajikMessagePublicKey } from "@majikah/majik-key";
+import type { MajikKey, MajikKeyAddress } from "@majikah/majik-key";
 
 import {
   encoder,
@@ -197,7 +197,7 @@ export class MajikInvoice {
   readonly userId?: string;
   readonly accountId?: string;
 
-  recipients?: MajikMessagePublicKey[];
+  recipients?: MajikKeyAddress[];
 
   // ── Public summary — always plaintext ────────────────────────────────────
   readonly public: PublicInvoiceSummary;
@@ -575,7 +575,7 @@ export class MajikInvoice {
    */
   async toEncrypted(
     recipients: MajikRecipient[],
-    recipientPublicKeys?: MajikMessagePublicKey[],
+    recipientPublicKeys?: MajikKeyAddress[],
     signerKey?: MajikKey,
     options?: { dropSignatures?: boolean; expectedSigners?: ExpectedSigner[] },
   ): Promise<MajikInvoice> {
@@ -939,7 +939,7 @@ export class MajikInvoice {
       signerKey?: MajikKey;
       recipients?: MajikRecipient[];
       expectedSigners?: ExpectedSigner[];
-      recipientPublicKeys?: MajikMessagePublicKey[];
+      recipientPublicKeys?: MajikKeyAddress[];
     } = {},
   ): Promise<MajikInvoice> {
     if (this.mode === "encrypted-and-signed") {
@@ -1261,7 +1261,7 @@ export class MajikInvoice {
       /** Optional — re-signs the converted invoice immediately */
       signerKey?: MajikKey;
       expectedSigners?: ExpectedSigner[];
-      recipientPublicKeys?: MajikMessagePublicKey[];
+      recipientPublicKeys?: MajikKeyAddress[];
       dropSignatures?: boolean;
     } = {},
   ): Promise<MajikInvoice> {
@@ -2485,11 +2485,11 @@ export class MajikInvoice {
    * Ensures ownership and routing fields are present.
    */
   toMajikahInvoiceJSON(
-    sender: MajikMessagePublicKey,
+    sender: MajikKeyAddress,
     options?: {
       userId?: string;
       accountId?: string;
-      recipients?: MajikMessagePublicKey[];
+      recipients?: MajikKeyAddress[];
       forceSignedOnly?: boolean;
     },
   ): MajikahInvoiceJSON {
@@ -3252,3 +3252,9 @@ export function dedupeInvoices(invoices: MajikInvoice[]): MajikInvoice[] {
     return true;
   });
 }
+
+// Freeze static methods
+Object.freeze(MajikInvoice);
+
+// Freeze instance methods
+Object.freeze(MajikInvoice.prototype);

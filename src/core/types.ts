@@ -4,7 +4,7 @@
  * proof of payment, and the Majikah cloud envelope (MajikahInvoiceJSON).
  */
 
-import type { MajikKey, MajikMessagePublicKey } from "@majikah/majik-key";
+import type { MajikKey, MajikKeyAddress } from "@majikah/majik-key";
 import type {
   CurrencyCode,
   GeneralInvoice,
@@ -178,7 +178,7 @@ export interface MajikInvoiceInput extends GeneralInvoiceInput {
    */
   accountId?: string;
 
-  recipientPublicKeys?: MajikMessagePublicKey[];
+  recipientPublicKeys?: MajikKeyAddress[];
 }
 
 // ---------------------------------------------------------------------------
@@ -199,7 +199,7 @@ export interface MajikInvoiceJSON {
    * Used to deliver the invoice to the correct user(s) or org(s).
    *
    */
-  recipients: MajikMessagePublicKey[];
+  recipients: MajikKeyAddress[];
 }
 
 // ---------------------------------------------------------------------------
@@ -269,7 +269,7 @@ export interface MajikInvoiceConstructorOptions {
   createdAt: ISODateTimeString;
   updatedAt: ISODateTimeString;
   decrypted?: DecryptedCache;
-  recipients?: MajikMessagePublicKey[];
+  recipients?: MajikKeyAddress[];
   sentAt?: ISODateTimeString;
 }
 
@@ -342,7 +342,6 @@ export type ConflictResolutionStrategy =
   | "local-wins"
   | "remote-wins";
 
-
 export interface InvoiceDiff {
   sameContent: boolean;
   sameInvoiceNumber: boolean;
@@ -352,4 +351,3 @@ export interface InvoiceDiff {
   updatedAtDeltaMs: number;
   contentHashChanged: boolean;
 }
-

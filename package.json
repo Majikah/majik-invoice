@@ -46,20 +46,29 @@
     "url": "https://github.com/Majikah/majik-invoice/issues"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
     "build": "tsc",
-    "prepublishOnly": "npm run build"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build",
+    "package": "npm run build && npm version patch && git push && git push --tags",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:gi": "vitest run test/general-invoice.test.ts",
+    "test:li": "vitest run test/line-item.test.ts",
+    "test:totals": "vitest run test/invoice-totals.test.ts",
+    "test:tax": "vitest run test/tax-manager.test.ts",
+    "test:core": "vitest run test/majik-invoice.test.ts"
   },
   "dependencies": {
-    "@majikah/majik-envelope": "^0.0.4",
-    "@majikah/majik-key": "^0.2.7",
-    "@majikah/majik-signature": "^0.0.17",
-    "@noble/hashes": "^2.2.0",
+    "@majikah/majik-envelope": "^0.1.0",
+    "@majikah/majik-key": "^0.6.0",
+    "@majikah/majik-signature": "^0.7.1",
+    "@noble/hashes": "^2.4.0",
     "@stablelib/sha256": "^2.0.1",
-    "@thezelijah/majik-money": "^1.0.4",
-    "uuid": "^14.0.0"
+    "@thezelijah/majik-money": "^2.1.0",
+    "uuid": "^14.0.2"
   },
   "devDependencies": {
-    "@types/node": "^25.6.0"
+    "@types/node": "^26.6.3",
+    "vitest": "^5.0.3"
   }
 }
