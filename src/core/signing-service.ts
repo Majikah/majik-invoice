@@ -21,7 +21,7 @@ export async function createSignatureJSON(
   options?: { timestamp?: string; allowlistHash?: string },
 ) {
   const sig = await MajikSignature.sign(contentBytes, key, {
-    contentType: "majik-invoice",
+    contentType: "application/vnd.majikah.invoice",
     timestamp: options?.timestamp,
     allowlistHash: options?.allowlistHash,
   });

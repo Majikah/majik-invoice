@@ -1,13 +1,25 @@
 /**
  * @file majik-invoice.ts
- * @description MajikInvoice — the cryptographically secured invoice envelope.
  *
- * Wraps a GeneralInvoice with optional ML-KEM-768 encryption (MajikEnvelope)
- * and hybrid Ed25519 + ML-DSA-87 digital signatures (MajikSignature).
+ * @description
+ * Cryptographically secured invoice envelope for the `@majikah/majik-invoice`
+ * domain.
  *
- * Two modes:
- *   "signed-only"          — GeneralInvoice is plaintext, integrity-sealed
- *   "encrypted-and-signed" — GeneralInvoice is encrypted; only public summary
+ * `MajikInvoice` wraps a {@link GeneralInvoice} with cryptographic integrity,
+ * optional ML-KEM-768 encryption, and hybrid Ed25519 + ML-DSA-87 signatures.
+ *
+ * The class supports two payload modes:
+ *
+ * - `signed-only`
+ *   The GeneralInvoice remains plaintext while its canonical content is
+ *   cryptographically committed and optionally signed/sealed.
+ *
+ * - `encrypted-and-signed`
+ *   The GeneralInvoice is encrypted inside a MajikEnvelope. Only the public
+ *   invoice summary remains available without decryption.
+ *
+ * `MajikInvoice` is the transport, security, and synchronization layer around
+ * the underlying business invoice represented by {@link GeneralInvoice}.
  */
 
 import { GeneralInvoice } from "./general-invoice";
@@ -88,51 +100,139 @@ import {
 import { buildEncryptedPayload } from "./encryption";
 import { incrementLastNumericSequence } from "./general-invoice/utils";
 
-// ── Batch / stats types ───────────────────────────────────────────────────
+// ── Batch / statistics result types ──────────────────────────────────────
 
+/**
+ * Result of decrypting multiple {@link MajikInvoice} instances.
+ *
+ * Successful invoices are returned in `decrypted`; invoices that could not
+ * be processed are returned in `errors` without aborting the entire batch.
+ */
 export interface BatchDecryptResult {
+  /**
+   * `true` when every invoice was processed successfully.
+   *
+   * An invoice being signed-only counts as a successful pass-through because
+   * no decryption is required.
+   */
   success: boolean;
+
+  /** Successfully processed invoice instances. */
   decrypted: MajikInvoice[];
-  errors: Array<{ invoiceId: string; reason: string }>;
+
+  /** Per-invoice decryption failures. */
+  errors: Array<{
+    invoiceId: string;
+    reason: string;
+  }>;
 }
 
+/**
+ * Result of clearing decrypted runtime caches across a batch.
+ */
 export interface BatchLockResult {
+  /** Number of encrypted invoices whose decrypted cache was cleared. */
   locked: number;
-  skipped: number; // signed-only invoices
+
+  /** Number of signed-only invoices skipped because they have no encrypted cache. */
+  skipped: number;
 }
 
+/**
+ * Result of automatically detecting and marking overdue invoices.
+ */
 export interface OverdueMarkResult {
-  marked: MajikInvoice[]; // updated invoice instances
+  /**
+   * Updated invoice instances that were detected as overdue and transitioned
+   * to `overdue`.
+   */
+  marked: MajikInvoice[];
+
+  /**
+   * Invoices that were intentionally not marked.
+   *
+   * - `encrypted` — plaintext could not be accessed
+   * - `not-overdue` — due date has not passed
+   * - `wrong-status` — current lifecycle does not permit the transition
+   */
   skipped: Array<{
     invoiceId: string;
     reason: "encrypted" | "not-overdue" | "wrong-status";
   }>;
 }
-// ── Sync types ────────────────────────────────────────────────────────────
 
+// ── Sync types ───────────────────────────────────────────────────────────
+
+/**
+ * Result of comparing local and remote invoice collections by invoice ID.
+ */
 export interface BatchSyncStatusResult {
+  /** Invoices whose local and remote content are identical. */
   synced: MajikInvoice[];
+
+  /** Invoices that exist on both sides but have different content hashes. */
   conflicts: SyncConflict[];
+
+  /** Invoices found locally but not remotely. */
   localOnly: MajikInvoice[];
+
+  /** Invoices found remotely but not locally. */
   remoteOnly: MajikInvoice[];
 }
 
+/**
+ * A single local/remote invoice synchronization conflict.
+ */
 export interface SyncConflict {
+  /** Shared invoice ID identifying the conflicting document. */
   id: string;
+
+  /** Local invoice version. */
   local: MajikInvoice;
+
+  /** Remote invoice version. */
   remote: MajikInvoice;
+
+  /** Structured comparison of the local and remote copies. */
   diff: InvoiceDiff;
 }
 
-// ── batchDuplicate ────────────────────────────────────────────────────────
+// ── Batch duplication ────────────────────────────────────────────────────
 
+/**
+ * Result of duplicating multiple invoices.
+ *
+ * Successful duplicates are returned in `duplicated`; individual failures are
+ * collected in `errors`.
+ */
 export interface BatchDuplicateResult {
+  /** Successfully duplicated invoices. */
   duplicated: MajikInvoice[];
-  errors: Array<{ invoiceId: string; reason: string }>;
+
+  /** Per-invoice duplication failures. */
+  errors: Array<{
+    invoiceId: string;
+    reason: string;
+  }>;
 }
 
+/**
+ * Result of decrypting a {@link MajikInvoice} into its underlying
+ * {@link GeneralInvoice}.
+ *
+ * `instance` is the corresponding MajikInvoice instance containing the
+ * runtime decrypted cache.
+ */
 export interface InvoiceDecryptionResult {
+  /** Decrypted business invoice. */
   invoice: GeneralInvoice;
+
+  /**
+   * MajikInvoice instance containing the decrypted runtime cache.
+   *
+   * This may be a new instance because decrypted state is intentionally
+   * represented as runtime state rather than persisted payload data.
+   */
   instance: MajikInvoice;
 }
 
@@ -140,6 +240,12 @@ export interface InvoiceDecryptionResult {
 // Schema version
 // ---------------------------------------------------------------------------
 
+/**
+ * Serialized schema version for the MajikInvoice envelope.
+ *
+ * This identifies the JSON representation of the cryptographic envelope and
+ * is independent of the inner `GeneralInvoice` schema version.
+ */
 const MAJIK_INVOICE_SCHEMA_VERSION = "1.0.0";
 
 // ---------------------------------------------------------------------------
@@ -147,75 +253,232 @@ const MAJIK_INVOICE_SCHEMA_VERSION = "1.0.0";
 // ---------------------------------------------------------------------------
 
 /**
- * Majik Invoice
- * ---
- * A cryptographically secured invoice.
+ * Cryptographically secured invoice envelope.
  *
- * Wraps GeneralInvoice with optional ML-KEM-768 encryption and hybrid
- * Ed25519 + ML-DSA-87 digital signatures.
+ * `MajikInvoice` wraps a {@link GeneralInvoice} with:
  *
- * @example — signed-only
+ * - SHA-256 content integrity
+ * - optional ML-KEM-768 encryption
+ * - hybrid Ed25519 + ML-DSA-87 signatures
+ * - signer allowlists
+ * - tamper-evident sealing
+ * - recipient routing information
+ * - runtime-only decrypted caching
+ * - JSON and binary serialization
+ * - CSV export
+ * - invoice synchronization and conflict analysis
+ *
+ * ### Payload modes
+ *
+ * #### `signed-only`
+ *
+ * The underlying `GeneralInvoice` is available directly in plaintext.
+ *
+ * This mode is useful when confidentiality is not required but document
+ * integrity and/or signatures are still required.
+ *
+ * #### `encrypted-and-signed`
+ *
+ * The underlying `GeneralInvoice` is encrypted in a {@link MajikEnvelope}.
+ *
+ * Without decryption, consumers can access only the public invoice summary
+ * and cryptographic metadata. The full invoice becomes available after
+ * successful decryption with an authorized {@link MajikKey}.
+ *
+ * ### Cryptographic layers
+ *
+ * The envelope separates three concepts:
+ *
+ * `contentHash`
+ * → SHA-256 commitment to the canonical `GeneralInvoice`
+ *
+ * signatures
+ * → cryptographic authorization over the invoice commitment
+ *
+ * seal
+ * → final cryptographic state indicating that no further signatures should
+ *   be added
+ *
+ * These concepts are intentionally independent:
+ *
+ * - an invoice can be unsigned
+ * - signed but not sealed
+ * - fully signed but not sealed
+ * - sealed after signing
+ *
+ * ### Public vs private data
+ *
+ * `public` is intentionally plaintext and contains the minimum summary needed
+ * for routing, display, and indexing.
+ *
+ * The full `GeneralInvoice` may remain inside `payload` when signed-only or
+ * inside the encrypted envelope when encrypted-and-signed.
+ *
+ * ### Immutability
+ *
+ * Operations that produce a changed invoice generally return a new
+ * `MajikInvoice` rather than mutating the existing envelope.
+ *
+ * Runtime decrypted cache clearing is the notable exception because it is a
+ * security-oriented in-memory operation.
+ *
+ * @example Signed-only invoice
  * ```ts
  * const invoice = await MajikInvoice.create({
  *   mode: "signed-only",
- *   signerKey: aliceKey,             // unlocked MajikKey
- *   issuer: { legalName: "Alice Corporation", tin: "123-456-789-000" },
- *   recipient: { legalName: "Bob Inc" },
+ *   signerKey: aliceKey,
+ *   issuer: {
+ *     legalName: "Alice Corporation",
+ *     tin: "123-456-789-000",
+ *   },
+ *   recipient: {
+ *     legalName: "Bob Inc",
+ *   },
  *   currency: "PHP",
- *   defaultTax: { taxType: "VAT", rate: 0.12 },
- *   lineItems: [{ description: "Design Services", quantity: 1, unitPrice: 50000 }],
+ *   lineItems: [
+ *     {
+ *       description: "Design Services",
+ *       quantity: 1,
+ *       unitPrice: 50000,
+ *     },
+ *   ],
  * });
  *
- * console.log(invoice.status);            // "sealed"
- * console.log(invoice.public.formattedTotal); // "₱56,000.00"
+ * console.log(invoice.status);
+ * console.log(invoice.public.formattedTotal);
  * ```
  *
- * @example — encrypted-and-signed
+ * @example Encrypted-and-signed invoice
  * ```ts
  * const invoice = await MajikInvoice.create({
  *   mode: "encrypted-and-signed",
  *   signerKey: aliceKey,
- *   recipientKeys: [bobKey],
- *   issuer: { legalName: "Alice Corporation" },
- *   recipient: { legalName: "Bob Inc" },
+ *   recipients: [bobRecipient],
+ *   issuer: {
+ *     legalName: "Alice Corporation",
+ *   },
+ *   recipient: {
+ *     legalName: "Bob Inc",
+ *   },
  *   currency: "PHP",
- *   lineItems: [{ description: "Confidential Services", quantity: 1, unitPrice: 100000 }],
+ *   lineItems: [
+ *     {
+ *       description: "Confidential Services",
+ *       quantity: 1,
+ *       unitPrice: 100000,
+ *     },
+ *   ],
  * });
  *
- * // Decrypt with Bob's key
  * const decrypted = await invoice.decrypt(bobKey);
- * console.log(decrypted.totals.grandTotal.format()); // "₱100,000.00"
+ * console.log(decrypted.invoice.totals.grandTotal.format());
  * ```
  */
 export class MajikInvoice {
   // ── Identity ──────────────────────────────────────────────────────────────
+
+  /**
+   * Stable unique identifier shared with the wrapped `GeneralInvoice`.
+   */
   readonly id: string;
+
+  /**
+   * Serialized MajikInvoice envelope schema version.
+   */
   readonly version: string;
+
+  /**
+   * Security/envelope mode of the invoice.
+   */
   readonly mode: MajikInvoiceMode;
 
-  // ── Cloud Routing & Ownership ─────────────────────────────────────────────
+  // ── Cloud Routing & Ownership ────────────────────────────────────────────
+
+  /**
+   * Optional cloud/user ownership identifier associated with the invoice.
+   */
   readonly userId?: string;
+
+  /**
+   * Optional account identifier used by cloud routing/storage.
+   */
   readonly accountId?: string;
 
+  /**
+   * Optional public routing addresses for invoice recipients.
+   *
+   * These are routing/public-key identifiers rather than decrypted invoice
+   * recipients contained inside the encrypted payload.
+   */
   recipients?: MajikKeyAddress[];
 
   // ── Public summary — always plaintext ────────────────────────────────────
+
+  /**
+   * Public invoice summary available without decrypting the payload.
+   *
+   * This contains presentation and routing information intended to remain
+   * plaintext even when the underlying `GeneralInvoice` is encrypted.
+   */
   readonly public: PublicInvoiceSummary;
 
   // ── Payload ───────────────────────────────────────────────────────────────
+
+  /**
+   * Actual invoice payload.
+   *
+   * In `signed-only` mode this contains the serialized `GeneralInvoice`.
+   *
+   * In `encrypted-and-signed` mode this contains the encrypted envelope
+   * string and recipient fingerprint metadata.
+   */
   readonly payload: MajikInvoicePayload;
 
   // ── Integrity ─────────────────────────────────────────────────────────────
+
+  /**
+   * Cryptographic integrity and signing state for the invoice.
+   *
+   * Contains the canonical content hash, attached signatures, allowlist
+   * information, and optional seal metadata.
+   */
   readonly integrity: IntegrityBlock;
 
   // ── Timestamps ────────────────────────────────────────────────────────────
+
+  /**
+   * Timestamp at which the MajikInvoice envelope was created.
+   */
   readonly createdAt: string;
+
+  /**
+   * Timestamp of the most recent envelope rebuild.
+   */
   readonly updatedAt: string;
+
+  /**
+   * Optional timestamp indicating when the invoice was sent/routed.
+   */
   readonly sentAt?: string;
 
   // ── Runtime-only decrypted cache (NOT persisted) ──────────────────────────
+
+  /**
+   * Runtime-only decrypted invoice cache.
+   *
+   * This field is deliberately excluded from serialized output so plaintext
+   * invoice data is not persisted merely because it was decrypted in memory.
+   */
   private _decrypted?: DecryptedCache;
 
+  /**
+   * Construct a MajikInvoice from normalized envelope state.
+   *
+   * This constructor is protected because instances should generally be
+   * produced through the public factories or controlled internal rebuild paths.
+   *
+   * @param opts - Fully initialized MajikInvoice state.
+   */
   protected constructor(opts: MajikInvoiceConstructorOptions) {
     this.version = MAJIK_INVOICE_SCHEMA_VERSION;
     this.id = opts.id;
@@ -232,6 +495,18 @@ export class MajikInvoice {
     this.sentAt = opts.sentAt;
   }
 
+  /**
+   * Rebuild the envelope while preserving unchanged state by default.
+   *
+   * The invoice ID, mode, payload, integrity, ownership, routing, and creation
+   * timestamp are carried forward unless explicitly overridden.
+   *
+   * `updatedAt` is refreshed for the rebuilt instance.
+   *
+   * @param overrides - Fields to replace in the rebuilt instance.
+   * @returns A new `MajikInvoice`.
+   * @internal
+   */
   private rebuild(
     overrides: Partial<MajikInvoiceConstructorOptions>,
   ): MajikInvoice {
@@ -253,20 +528,50 @@ export class MajikInvoice {
   }
 
   // ==========================================================================
-  // ── STATIC FACTORY ─────────────────────────────────────────────────────────
+  // ── STATIC FACTORY
   // ==========================================================================
 
   /**
-   * Create a MajikInvoice from a GeneralInvoiceInput.
+   * Create a new MajikInvoice from {@link MajikInvoiceInput}.
    *
-   * If signerKey is provided the invoice is signed immediately.
-   * If mode is "encrypted-and-signed" and recipientKeys are provided,
-   * encryption is applied before signing.
+   * The creation pipeline is:
    *
-   * @throws {MajikInvoiceError} on invalid input
-   * @throws {MajikInvoiceKeyError} on locked or missing keys
-   * @throws {MajikInvoiceEncryptionError} if encryption fails
-   * @throws {MajikInvoiceSignatureError} if signing fails
+   * 1. Validate security-specific input requirements.
+   * 2. Build the underlying {@link GeneralInvoice}.
+   * 3. Build the always-plaintext public summary.
+   * 4. Calculate the canonical content hash.
+   * 5. Build either a plaintext or encrypted payload.
+   * 6. Create the initial integrity block.
+   * 7. Optionally sign immediately when `signerKey` is provided.
+   *
+   * Encryption occurs before the invoice is exposed as a completed
+   * `MajikInvoice`, while signatures operate on the canonical invoice
+   * commitment rather than directly on the encrypted envelope.
+   *
+   * @param input - Invoice, security, recipient, and routing configuration.
+   * @returns Newly created MajikInvoice.
+   * @throws {@link MajikInvoiceError} When input configuration is invalid.
+   * @throws {@link MajikInvoiceKeyError} When required keys/recipients are
+   * missing or unusable.
+   * @throws {@link MajikInvoiceEncryptionError} When payload encryption fails.
+   * @throws {@link MajikInvoiceSignatureError} When initial signing fails.
+   *
+   * @example
+   * ```ts
+   * const invoice = await MajikInvoice.create({
+   *   mode: "signed-only",
+   *   issuer: { legalName: "Acme Corp" },
+   *   recipient: { legalName: "Client Inc" },
+   *   currency: "PHP",
+   *   lineItems: [
+   *     {
+   *       description: "Development",
+   *       quantity: 1,
+   *       unitPrice: 25000,
+   *     },
+   *   ],
+   * });
+   * ```
    */
   static async create(input: MajikInvoiceInput): Promise<MajikInvoice> {
     MajikInvoice._assertValidInput(input);
@@ -315,7 +620,7 @@ export class MajikInvoice {
       } satisfies SignedOnlyPayload;
     }
 
-    // ── 5. Build integrity block ─────────────────────────────────────────────
+    // ── 5. Build integrity block ────────────────────────────────────────────
     const now = new Date().toISOString();
     const integrity: IntegrityBlock = {
       contentHash,
@@ -338,7 +643,7 @@ export class MajikInvoice {
       sentAt: undefined,
     });
 
-    // ── 6. Sign immediately if signerKey provided ────────────────────────────
+    // ── 6. Sign immediately if signerKey provided ───────────────────────────
     if (signerKey) {
       return instance.sign(
         signerKey,
@@ -349,23 +654,31 @@ export class MajikInvoice {
     return instance;
   }
 
-  // ── restartInvoice ────────────────────────────────────────────────────────
+  // ── Invoice restart ──────────────────────────────────────────────────────
 
   /**
-   * Restart this invoice to draft status, clearing all payments.
-   * Preserves all financial data, parties, line items, taxes, and metadata.
+   * Restart the underlying invoice as a fresh draft envelope.
    *
-   * Bypasses lifecycle transition guards — works even on voided invoices.
+   * Financial data, parties, line items, taxes, dates, references, notes, tags,
+   * and metadata are preserved by the underlying `GeneralInvoice.restartInvoice`
+   * operation.
    *
-   * For encrypted invoices, decryptKey is required to access the inner
-   * GeneralInvoice. The result is always returned as "signed-only" unless
-   * you re-encrypt via toEncrypted() afterwards.
+   * The resulting invoice:
    *
-   * All existing signatures and the seal are cleared — re-sign after restart.
+   * - has `draft` lifecycle status
+   * - has all proof-of-payment records cleared
+   * - has all signatures and seal state cleared
+   * - must be signed again before it can be sealed
    *
-   * @throws {MajikInvoiceError}           if encrypted and no decryptKey provided
-   * @throws {MajikInvoiceKeyError}        if decryptKey is locked or missing ML-KEM key
-   * @throws {MajikInvoiceEncryptionError} if decryption fails
+   * Encrypted invoices must first be decrypted. The restarted result is
+   * converted to `signed-only` mode.
+   *
+   * @param decryptKey - Required when the current invoice is encrypted.
+   * @returns A restarted, unsigned `MajikInvoice`.
+   * @throws {@link MajikInvoiceError} When an encrypted invoice is missing
+   * the required decryption key.
+   * @throws {@link MajikInvoiceKeyError} When the decryption key is invalid.
+   * @throws {@link MajikInvoiceEncryptionError} When decryption fails.
    */
   async restartInvoice(decryptKey?: MajikKey): Promise<MajikInvoice> {
     let gi: GeneralInvoice;
@@ -390,16 +703,12 @@ export class MajikInvoice {
 
     const restarted = gi.restartInvoice();
 
-    // Recompute hash: false — financial content is unchanged.
-    // But we explicitly clear signatures since this is an intentional
-    // operational reset (status + payments changed).
+    // Financial content is unchanged, so preserve the existing content hash.
     finalInvoice = finalInvoice._reissueFromMutation(restarted, {
       recomputeHash: false,
     });
 
-    // Manually strip signatures/seal from the rebuilt instance.
-    // _reissueFromMutation with recomputeHash:false preserves them,
-    // but a restart must be re-signed from scratch.
+    // Restart requires a completely fresh signature/seal state.
     const clearedIntegrity: IntegrityBlock = {
       ...finalInvoice.integrity,
       signatures: [],
@@ -411,9 +720,16 @@ export class MajikInvoice {
   }
 
   // ==========================================================================
-  // ── METADATA & SETTLEMENT MUTATIONS ───────────────────────────────────────
+  // ── METADATA & SETTLEMENT MUTATIONS
   // ==========================================================================
 
+  /**
+   * Set the cloud/user ownership identifier.
+   *
+   * @param userId - Non-empty user identifier.
+   * @returns A new invoice with the updated user ID.
+   * @throws {@link MajikInvoiceError} When `userId` is empty.
+   */
   withUserId(userId: string): MajikInvoice {
     if (!userId?.trim()) {
       throw new MajikInvoiceError("userId cannot be empty.");
@@ -421,6 +737,13 @@ export class MajikInvoice {
     return this.rebuild({ userId: userId.trim() });
   }
 
+  /**
+   * Set the account identifier used by cloud routing/storage.
+   *
+   * @param accountId - Non-empty account identifier.
+   * @returns A new invoice with the updated account ID.
+   * @throws {@link MajikInvoiceError} When `accountId` is empty.
+   */
   withAccountId(accountId: string): MajikInvoice {
     if (!accountId?.trim()) {
       throw new MajikInvoiceError("accountId cannot be empty.");
@@ -428,6 +751,16 @@ export class MajikInvoice {
     return this.rebuild({ accountId: accountId.trim() });
   }
 
+  /**
+   * Add a proof-of-payment record to the underlying invoice.
+   *
+   * Settlement state is recalculated by `GeneralInvoice`, then reflected in
+   * the MajikInvoice envelope.
+   *
+   * @param proof - Payment proof to add.
+   * @returns A new MajikInvoice with updated settlement state.
+   * @throws Errors from underlying invoice payment validation.
+   */
   addPayment(proof: ProofOfPayment): MajikInvoice {
     const invoice = this._requirePlaintextInvoice("addPayment");
 
@@ -436,6 +769,13 @@ export class MajikInvoice {
     return this._reissueFromMutation(updated);
   }
 
+  /**
+   * Remove a proof-of-payment record.
+   *
+   * @param paymentId - ID of the payment proof to remove.
+   * @returns A new MajikInvoice with recalculated settlement state.
+   * @throws Errors from underlying invoice payment validation.
+   */
   removePayment(paymentId: string): MajikInvoice {
     const invoice = this._requirePlaintextInvoice("removePayment");
 
@@ -444,6 +784,12 @@ export class MajikInvoice {
     return this._reissueFromMutation(updated);
   }
 
+  /**
+   * Remove all payment records from the underlying invoice.
+   *
+   * @returns A new MajikInvoice with an empty payment history.
+   * @throws Errors from underlying invoice settlement validation.
+   */
   clearPayments(): MajikInvoice {
     const invoice = this._requirePlaintextInvoice("clearPayments");
 
@@ -453,9 +799,18 @@ export class MajikInvoice {
   }
 
   // ==========================================================================
-  // ── GETTERS ─────────────────────────────────────────────────────────────────
+  // ── GETTERS
   // ==========================================================================
 
+  /**
+   * Get the total amount recorded as paid.
+   *
+   * Returns `null` while an encrypted invoice remains locked because the
+   * payment history is part of the private `GeneralInvoice`.
+   *
+   * @returns Total paid as `MajikMoney`, or `null` while encrypted and
+   * undecrypted.
+   */
   get totalPaid(): MajikMoney | null {
     if (this.mode === "encrypted-and-signed") {
       const decryptedInvoice = this._decrypted?.invoice;
@@ -470,6 +825,14 @@ export class MajikInvoice {
     return this.invoice.totalPaid;
   }
 
+  /**
+   * Determine whether the invoice is fully settled.
+   *
+   * Returns `null` while an encrypted invoice remains locked because settlement
+   * cannot be determined from the public summary alone.
+   *
+   * @returns `true`, `false`, or `null` when encrypted and locked.
+   */
   get isFullyPaid(): boolean | null {
     if (this.mode === "encrypted-and-signed") {
       const decryptedInvoice = this._decrypted?.invoice;
@@ -484,6 +847,14 @@ export class MajikInvoice {
     return this.invoice.isFullyPaid;
   }
 
+  /**
+   * Get the derived payment settlement state.
+   *
+   * Returns `null` while an encrypted invoice remains locked.
+   *
+   * @returns Current {@link PaymentStatus}, or `null` when settlement data is
+   * inaccessible.
+   */
   get paymentStatus(): PaymentStatus | null {
     if (this.mode === "encrypted-and-signed") {
       const decryptedInvoice = this._decrypted?.invoice;
@@ -498,6 +869,13 @@ export class MajikInvoice {
     return this.invoice.paymentStatus;
   }
 
+  /**
+   * Get all recorded payment proofs.
+   *
+   * Returns `null` while an encrypted invoice is locked.
+   *
+   * @returns A copy of the payment-proof collection, or `null` when unavailable.
+   */
   get payments(): ProofOfPayment[] | null {
     if (this.mode === "encrypted-and-signed") {
       const decryptedInvoice = this._decrypted?.invoice;
@@ -512,11 +890,22 @@ export class MajikInvoice {
     return [...this.invoice.proofOfPayments];
   }
 
+  /**
+   * Get the public issue date as a JavaScript `Date`.
+   *
+   * This getter reads from the always-plaintext public summary and therefore
+   * does not require decryption.
+   */
   get issueDate(): Date {
     const parsedDate: Date = new Date(this.public.issuedAt);
     return parsedDate;
   }
 
+  /**
+   * Get the public due date as a JavaScript `Date`.
+   *
+   * Returns `null` when no due date is present in the public summary.
+   */
   get dueDate(): Date | null {
     if (!this.public.dueDate?.trim()) {
       return null;
@@ -526,52 +915,35 @@ export class MajikInvoice {
   }
 
   // ==========================================================================
-  // ── MODE CONVERSION ────────────────────────────────────────────────────────
+  // ── MODE CONVERSION
   // ==========================================================================
 
   /**
-   * Convert a signed-only MajikInvoice to an encrypted-and-signed one.
-   * Returns a NEW MajikInvoice. The original is untouched.
+   * Convert a signed-only invoice into an encrypted-and-signed invoice.
    *
-   * ---
+   * The original invoice is not modified.
    *
-   * **Signature behaviour** (`options.dropSignatures`, default: `false`):
+   * By default, existing signatures and seal information are carried forward.
+   * Set `dropSignatures: true` to intentionally clear the existing cryptographic
+   * authorization state and require re-signing.
    *
-   * - `false` — existing signatures are carried over. The converted invoice
-   *   retains its cryptographic history; the allowlist and seal are preserved as-is.
-   *   Use this for pure mode conversion where the signing chain must remain intact.
+   * When an allowlist override is supplied, signatures must be dropped because
+   * existing signatures contain the previous allowlist commitment.
    *
-   * - `true`  — all signatures, the seal, and sealInfo are cleared. The converted
-   *   invoice is unsigned and must be re-signed from scratch. Use this when the
-   *   issuer is reissuing or restarting the invoice lifecycle.
+   * Supplying `signerKey` optionally signs the converted envelope immediately.
+   * When the signer is already represented in the preserved signature set,
+   * no redundant signature operation is performed.
    *
-   * ---
-   *
-   * **Allowlist override** (`options.expectedSigners`):
-   *
-   * Only valid when `dropSignatures: true`. Each carried-over signature embeds its
-   * own `allowlistHash` — replacing the allowlist while preserving signatures would
-   * create a mismatch against those embedded hashes. Passing `expectedSigners`
-   * with `dropSignatures: false` throws.
-   *
-   * ---
-   *
-   * **Auto-sign** (`signerKey`):
-   *
-   * If provided, the converted invoice is signed immediately. If the key is already
-   * present in the carried-over signature set (`dropSignatures: false`), the sign
-   * step is skipped — the existing entry is authoritative.
-   *
-   * @param recipients              Recipient list for the ML-KEM envelope.
-   * @param recipientPublicKeys     Optional public key strings for cloud routing.
-   * @param signerKey               Optional. If provided, signs the converted invoice immediately.
-   * @param options.dropSignatures  Clear all signatures and seal (default: `false`).
-   * @param options.expectedSigners Override the allowlist. Requires `dropSignatures: true`.
-   *
-   * @throws {MajikInvoiceError}           if already encrypted
-   * @throws {MajikInvoiceError}           if expectedSigners is set without dropSignatures: true
-   * @throws {MajikInvoiceKeyError}        if recipientKeys are locked or missing
-   * @throws {MajikInvoiceEncryptionError} if encryption fails
+   * @param recipients - ML-KEM recipients for the encrypted payload.
+   * @param recipientPublicKeys - Optional public routing addresses for the recipients.
+   * @param signerKey - Optional key used to sign the converted invoice immediately.
+   * @param options - Signature/allowlist conversion controls.
+   * @returns A new encrypted-and-signed invoice.
+   * @throws {@link MajikInvoiceError} When already encrypted or when an
+   * incompatible allowlist override is supplied.
+   * @throws {@link MajikInvoiceKeyError} When recipient information or keys
+   * are invalid.
+   * @throws {@link MajikInvoiceEncryptionError} When encryption fails.
    */
   async toEncrypted(
     recipients: MajikRecipient[],
@@ -587,9 +959,8 @@ export class MajikInvoice {
 
     const dropSignatures = options?.dropSignatures ?? false;
 
-    // Allowlist override is only valid when dropping signatures.
-    // When preserving signatures, each carries its own allowlistHash — replacing
-    // the expectedSigners list would create a mismatch against those embedded hashes.
+    // Existing signatures embed their allowlist hash, so an allowlist
+    // override requires a fresh signature set.
     if (options?.expectedSigners && !dropSignatures) {
       throw new MajikInvoiceError(
         "toEncrypted(): expectedSigners override requires dropSignatures: true. " +
@@ -634,9 +1005,8 @@ export class MajikInvoice {
     });
 
     if (signerKey) {
-      // Key already carried over from the preserved signature set — no-op.
-      // Calling sign() again would just overwrite the same entry, which is
-      // harmless but redundant. Skip it.
+      // Avoid creating a redundant replacement signature when the same signer
+      // already exists in the preserved signature collection.
       if (converted.hasSigned(signerKey)) return converted;
 
       return converted.sign(signerKey, { expectedSigners });
@@ -645,48 +1015,25 @@ export class MajikInvoice {
   }
 
   /**
-   * Convert an encrypted-and-signed MajikInvoice to a signed-only (plaintext) one.
-   * Returns a NEW MajikInvoice. The original is untouched.
+   * Convert an encrypted-and-signed invoice into a signed-only invoice.
    *
-   * ---
+   * The original invoice remains untouched.
    *
-   * **Signature behaviour** (`options.dropSignatures`, default: `false`):
+   * Existing signatures and seal state are preserved by default. Setting
+   * `dropSignatures: true` intentionally produces an unsigned plaintext
+   * invoice that must be signed again.
    *
-   * - `false` — existing signatures are carried over. The converted invoice
-   *   retains its cryptographic history; the allowlist and seal are preserved as-is.
-   *   Use this for pure mode conversion (e.g. converting for a local/offline workflow)
-   *   where the signing chain must remain intact.
+   * Because the underlying invoice must be decrypted first, an authorized
+   * ML-KEM decryption key is required.
    *
-   * - `true`  — all signatures, the seal, and sealInfo are cleared. The converted
-   *   invoice is unsigned and must be re-signed from scratch. Use this when the
-   *   issuer is reissuing or restarting the invoice lifecycle.
-   *
-   * ---
-   *
-   * **Allowlist override** (`options.expectedSigners`):
-   *
-   * Only valid when `dropSignatures: true`. Each carried-over signature embeds its
-   * own `allowlistHash` — replacing the allowlist while preserving signatures would
-   * create a mismatch against those embedded hashes. Passing `expectedSigners`
-   * with `dropSignatures: false` throws.
-   *
-   * ---
-   *
-   * **Auto-sign** (`signerKey`):
-   *
-   * If provided, the converted invoice is signed immediately. If the key is already
-   * present in the carried-over signature set (`dropSignatures: false`), the sign
-   * step is skipped — the existing entry is authoritative.
-   *
-   * @param decryptKey       Unlocked MajikKey used to decrypt the envelope.
-   * @param signerKey        Optional. If provided, signs the converted invoice immediately.
-   * @param options.dropSignatures  Clear all signatures and seal (default: `false`).
-   * @param options.expectedSigners Override the allowlist. Requires `dropSignatures: true`.
-   *
-   * @throws {MajikInvoiceError}           if already signed-only
-   * @throws {MajikInvoiceError}           if expectedSigners is set without dropSignatures: true
-   * @throws {MajikInvoiceKeyError}        if decryptKey is locked or missing ML-KEM key
-   * @throws {MajikInvoiceEncryptionError} if decryption fails
+   * @param decryptKey - Key used to decrypt the encrypted envelope.
+   * @param signerKey - Optional key used to sign the resulting plaintext invoice.
+   * @param options - Signature/allowlist conversion controls.
+   * @returns A new signed-only invoice.
+   * @throws {@link MajikInvoiceError} When already signed-only or when an
+   * incompatible allowlist override is supplied.
+   * @throws {@link MajikInvoiceKeyError} When the decryption key is unusable.
+   * @throws {@link MajikInvoiceEncryptionError} When decryption fails.
    */
   async toSignedOnly(
     decryptKey: MajikKey,
@@ -708,9 +1055,9 @@ export class MajikInvoice {
     };
 
     const dropSignatures = options?.dropSignatures ?? false;
-    // Allowlist override is only valid when dropping signatures.
-    // When preserving signatures, each carries its own allowlistHash — replacing
-    // the expectedSigners list would create a mismatch against those embedded hashes.
+
+    // Existing signatures embed their allowlist hash, so an allowlist
+    // override requires a fresh signature set.
     if (options?.expectedSigners && !dropSignatures) {
       throw new MajikInvoiceError(
         "toSignedOnly(): expectedSigners override requires dropSignatures: true. " +
@@ -749,9 +1096,6 @@ export class MajikInvoice {
     this.secureLock();
 
     if (signerKey) {
-      // Key already carried over from the preserved signature set — no-op.
-      // Calling sign() again would just overwrite the same entry, which is
-      // harmless but redundant. Skip it.
       if (converted.hasSigned(signerKey)) return converted;
 
       return converted.sign(signerKey, { expectedSigners: expectedSigners });
@@ -760,17 +1104,22 @@ export class MajikInvoice {
   }
 
   // ==========================================================================
-  // ── GETTERS ─────────────────────────────────────────────────────────────────
+  // ── GETTERS
   // ==========================================================================
 
   /**
-   * Runtime posture of this invoice.
+   * Get the cryptographic integrity posture of the invoice.
    *
-   * "sealed"          — sealed and signed  (encrypted or plaintext)
-   * "fully-signed"    — all expected signers have signed; not yet sealed
-   * "partially-signed"— at least one signature but allowlist not fully satisfied
-   * "unsigned"        — invoice created but no signatures attached yet
-   * "invalid"         — structural or cryptographic verification failed
+   * Possible values include:
+   *
+   * - `unsigned` — no signatures exist
+   * - `partially-signed` — signatures exist but the expected signer set is not complete
+   * - `fully-signed` — all expected signers have signed
+   * - `sealed` — invoice has been cryptographically sealed
+   * - `invalid` — structural validation failed
+   *
+   * This describes cryptographic state and should not be confused with
+   * {@link status}, which describes business/lifecycle state.
    */
   get integrityStatus(): MajikInvoiceStatus {
     try {
@@ -796,31 +1145,22 @@ export class MajikInvoice {
   }
 
   /**
-   * Current business/lifecycle status of the invoice.
+   * Get the current business/lifecycle status of the invoice.
    *
-   * Represents the operational state of the invoice within
-   * the billing and payment workflow.
+   * For encrypted invoices that are still locked, the value is taken from the
+   * public summary because the underlying `GeneralInvoice` is inaccessible.
    *
-   * Possible values:
-   *
-   * - "draft"    — invoice is still being prepared
-   * - "issued"   — invoice has been finalized and issued
-   * - "sent"     — invoice has been delivered to recipients
-   * - "viewed"   — invoice has been opened by the recipient
-   * - "partial"  — invoice has received a partial payment
-   * - "paid"     — invoice has been fully settled
-   * - "overdue"  — payment due date has passed unpaid
-   * - "void"     — invoice has been cancelled/voided
-   * - "disputed" — invoice has an active dispute
-   *
-   * This is the primary business-facing invoice status and
-   * should not be confused with `integrityStatus`, which
-   * describes the cryptographic/signature posture of the invoice.
+   * This is intentionally separate from {@link integrityStatus}.
    */
   get status(): InvoiceStatus {
     return this.isLocked ? this.public.status : this.invoice.status;
   }
 
+  /**
+   * Get a human-readable presentation label for the cryptographic invoice state.
+   *
+   * This combines integrity posture with encryption state for UI display.
+   */
   get displayStatus(): string {
     if (this.integrityStatus === "invalid") return "Invalid";
     if (this.integrityStatus === "unsigned") return "Unsigned";
@@ -843,22 +1183,24 @@ export class MajikInvoice {
   }
 
   /**
-   *Returns `true` if the mode is `encrypted-and-signed`
+   * Whether this invoice uses the encrypted-and-signed payload mode.
    */
   get isEncrypted(): boolean {
     return this.mode === "encrypted-and-signed";
   }
 
   /**
-   *Returns `true` if the mode is `signed-only`
+   * Whether this invoice uses the signed-only plaintext mode.
    */
   get isSignedOnly(): boolean {
     return this.mode === "signed-only";
   }
 
   /**
-   * Returns `true` if the invoice is encrypted-and-signed and currently not unlocked or decrypted.
-   * Defaults to `false` if the invoice is signed-only
+   * Whether an encrypted invoice is currently locked.
+   *
+   * Signed-only invoices are never considered locked because their
+   * `GeneralInvoice` payload is already available in plaintext.
    */
   get isLocked(): boolean {
     if (this.isSignedOnly) return false;
@@ -866,45 +1208,82 @@ export class MajikInvoice {
     return !this.decryptedInvoice || !this.decryptedCache;
   }
 
+  /**
+   * Whether at least one cryptographic signature is attached.
+   */
   get isSigned(): boolean {
     return this.integrity.signatures.length > 0;
   }
 
+  /**
+   * Whether the invoice is sealed against further signatures.
+   */
   get isSealed(): boolean {
     return this.integrity.isSealed;
   }
 
+  /**
+   * Number of signatures currently attached to the invoice.
+   */
   get signatureCount(): number {
     return this.integrity.signatures.length;
   }
 
+  /**
+   * Get the fingerprints of all signers currently represented in the signature set.
+   */
   get signerIds(): string[] {
     return this.integrity.signatures.map((s) => s.signerId);
   }
 
+  /**
+   * Whether a runtime decrypted cache currently exists.
+   *
+   * This does not indicate whether the cached plaintext is persisted—it is
+   * intentionally runtime-only.
+   */
   get hasDecryptedCache(): boolean {
     return this._decrypted !== undefined;
   }
 
-  /** The cached decrypted GeneralInvoice, if decryption has run this session. */
+  /**
+   * Get the cached decrypted {@link GeneralInvoice}, when available.
+   *
+   * Returns `undefined` when no decrypted cache exists.
+   */
   get decryptedInvoice(): GeneralInvoice | undefined {
     return this._decrypted?.invoice;
   }
 
-  /** Decrypted cache metadata (who decrypted, when). */
+  /**
+   * Get decrypted cache metadata.
+   *
+   * This can be used to inspect who decrypted the invoice and when.
+   */
   get decryptedCache(): DecryptedCache | undefined {
     return this._decrypted;
   }
 
+  /**
+   * Get the SHA-256 content commitment for the underlying invoice.
+   *
+   * This is the hash stored in the integrity block and used as the basis for
+   * signature input.
+   */
   get hash(): string {
     return this.integrity.contentHash;
   }
 
   /**
-   * Access the plaintext GeneralInvoice directly.
-   * Only available in "signed-only" mode or after decrypt() has been called.
+   * Access the underlying plaintext {@link GeneralInvoice}.
    *
-   * @throws {MajikInvoiceError} if invoice is encrypted and not yet decrypted
+   * In signed-only mode the plaintext payload can be reconstructed directly.
+   *
+   * In encrypted-and-signed mode, the invoice is available only when a
+   * successful decryption has populated the runtime cache.
+   *
+   * @throws {@link MajikInvoiceError} When the invoice is encrypted and has
+   * not yet been decrypted.
    */
   get invoice(): GeneralInvoice {
     if (this.mode === "signed-only") {
@@ -920,18 +1299,32 @@ export class MajikInvoice {
     );
   }
 
+  /**
+   * Alias for the always-plaintext public invoice summary.
+   */
   get summary(): PublicInvoiceSummary {
     return this.public;
   }
 
   /**
-   * Issue a new MajikInvoice from a modified GeneralInvoice.
-   * All existing signatures are dropped — the caller must re-sign.
-   * Mode, createdAt, and (if encrypted) recipient fingerprints are preserved.
+   * Reissue the invoice after a genuine business/financial modification.
    *
-   * @throws {MajikInvoiceKeyError} if mode is "encrypted-and-signed" and no recipientKeys provided
-   * @throws {MajikInvoiceKeyError} if signerKey is locked or missing signing keys
-   * @throws {MajikInvoiceEncryptionError} if re-encryption fails
+   * A reissue represents changed source content, so the resulting invoice
+   * receives a new canonical content commitment and all previous signatures
+   * are discarded.
+   *
+   * For encrypted invoices, a new recipient list and recipient routing keys
+   * are required because the modified payload must be encrypted again.
+   *
+   * The original invoice is not modified.
+   *
+   * @param updatedInvoice - Modified underlying GeneralInvoice.
+   * @param options - Optional signing, recipient, allowlist, and routing inputs.
+   * @returns Newly reissued MajikInvoice.
+   * @throws {@link MajikInvoiceKeyError} When encrypted reissuance lacks
+   * required recipients or routing keys.
+   * @throws {@link MajikInvoiceEncryptionError} When re-encryption fails.
+   * @throws {@link MajikInvoiceSignatureError} When signing is requested and fails.
    */
   async reissue(
     updatedInvoice: GeneralInvoice,
@@ -966,8 +1359,7 @@ export class MajikInvoice {
           "recipientPublicKeys are required to reissue an encrypted-and-signed invoice.",
         );
       }
-      // Encrypted path — must rebuild payload manually since _reissueFromMutation
-      // cannot handle re-encryption without recipients context.
+
       const publicSummary = MajikInvoice._buildPublicSummary(updatedInvoice);
       const contentHash = sha256Hex(updatedInvoice.toCanonicalBytes());
       const payload = await buildEncryptedPayload(
@@ -995,7 +1387,6 @@ export class MajikInvoice {
         accountId: this.accountId,
       });
     } else {
-      // Signed-only path — delegate to _reissueFromMutation with hash recompute.
       reissued = this._reissueFromMutation(updatedInvoice, {
         recomputeHash: true,
       });
@@ -1014,21 +1405,27 @@ export class MajikInvoice {
   }
 
   /**
-   * Internal base for all recipient-side mutations.
+   * Internal recipient-side mutation pipeline shared by `receive()` and
+   * `countersign()`.
    *
-   * Handles both "signed-only" and "encrypted-and-signed" modes:
+   * The method enforces recipient authorization before rebuilding the invoice.
    *
-   *   signed-only          → rebuilds payload via rebuild(), appends signature
-   *   encrypted-and-signed → re-encrypts with recipients, appends signature
+   * Common invariants include:
    *
-   * Invariants held across both modes:
-   *   - contentHash is always preserved (status / payment mutations are excluded
-   *     from toSignableJSON, so existing signatures remain cryptographically valid)
-   *   - expectedSigners, allowlistSignerId, sealInfo forwarded as-is
-   *   - existing signatures are preserved — only the recipient's sig is appended
-   *   - the issuer (allowlistSignerId) is never permitted to call this
+   * - the invoice must not be sealed
+   * - an expected-signer allowlist must exist
+   * - the signer must be on that allowlist
+   * - the issuer cannot use the recipient mutation path
+   * - the updated invoice must retain the same invoice ID
    *
-   * @internal — use receive() for the public encrypted-only contract
+   * For encrypted invoices the updated payload is re-encrypted before the
+   * recipient signature is appended.
+   *
+   * @param updatedInvoice - Mutated underlying GeneralInvoice.
+   * @param options - Authorized recipient signing and, when required,
+   * re-encryption participants.
+   * @returns A new MajikInvoice containing the recipient mutation/signature.
+   * @internal
    */
   private async _receiveBase(
     updatedInvoice: GeneralInvoice,
@@ -1096,7 +1493,7 @@ export class MajikInvoice {
     let rebuilt: MajikInvoice;
 
     if (this.mode === "encrypted-and-signed") {
-      // ML-KEM assertion only required for the encrypted path
+      // ML-KEM capability is required for the encrypted recipient path.
       assertKeyHasMlKem(signerKey, "receive");
 
       if (!this.canDecrypt(signerKey)) {
@@ -1113,8 +1510,7 @@ export class MajikInvoice {
         );
       }
 
-      // Decrypt to validate access — the updatedInvoice was already mutated
-      // by the caller so we don't re-derive it here.
+      // Validate recipient access by successfully decrypting the existing envelope.
       await this.decrypt(signerKey);
 
       const newPayload = await buildEncryptedPayload(
@@ -1124,8 +1520,7 @@ export class MajikInvoice {
 
       const newPublic = MajikInvoice._buildPublicSummary(updatedInvoice);
 
-      // Rebuild integrity preserving everything from the issuer.
-      // contentHash is kept as-is — see invariant note on the method.
+      // Preserve the issuer-established integrity/signing configuration.
       const newIntegrity: IntegrityBlock = {
         contentHash: this.integrity.contentHash,
         hashAlgorithm: this.integrity.hashAlgorithm,
@@ -1149,36 +1544,30 @@ export class MajikInvoice {
         recipients: this.recipients,
       } as MajikInvoiceConstructorOptions);
     } else {
-      // signed-only path — rebuild() handles payload + public summary update.
-      // contentHash is preserved via recomputeHash: false.
-      // Existing signatures are preserved — we only drop signatures when
-      // recomputeHash is true, which is the issuer reissue() path.
+      // Plaintext recipient path. Existing integrity/signature state is retained.
       rebuilt = this._reissueFromMutation(updatedInvoice, {
         recomputeHash: false,
       });
     }
 
-    // ── 8. Append recipient signature ─────────────────────────────────────────
-    // sign() enforces allowlist membership (double-checked, but correct) and
-    // replaces any existing entry from this signer rather than duplicating.
-    // We do not pass expectedSigners — the allowlist is already on the rebuilt
-    // integrity block and sign() reads it from there.
+    // Append or replace the recipient's signature.
     return rebuilt.sign(signerKey);
   }
 
-  // ---------------------------------------------------------------------------
-
   /**
-   * Recipient-side mutation for encrypted transport invoices.
+   * Recipient-side mutation workflow for encrypted invoices.
    *
-   * Strict public wrapper over _receiveBase() — requires recipients and
-   * enforces that the invoice is "encrypted-and-signed". This is the method
-   * used by MajikBuwizDatabase for all inbound invoice lifecycle actions.
+   * Requires an `encrypted-and-signed` invoice and an expected-signer allowlist.
+   * The recipient decrypts, applies the updated GeneralInvoice, re-encrypts the
+   * payload for the supplied participant set, and adds their signature.
    *
-   * @param updatedInvoice          The mutated GeneralInvoice.
-   * @param options.signerKey       Unlocked MajikKey belonging to the recipient.
-   * @param options.recipients      Full participant list for re-encryption
-   *                                (all original recipients + issuer).
+   * @param updatedInvoice - Updated underlying GeneralInvoice.
+   * @param options - Recipient signing key and full re-encryption recipient set.
+   * @returns A new encrypted-and-signed MajikInvoice.
+   * @throws {@link MajikInvoiceError} When used with a signed-only invoice.
+   * @throws {@link MajikInvoiceKeyError} When required keys/recipients are missing.
+   * @throws {@link MajikInvoiceEncryptionError} When decryption/re-encryption fails.
+   * @throws {@link MajikInvoiceSignatureError} When recipient authorization fails.
    */
   async receive(
     updatedInvoice: GeneralInvoice,
@@ -1199,25 +1588,17 @@ export class MajikInvoice {
   }
 
   /**
-   * Recipient-side mutation for signed-only (plaintext) invoices.
+   * Recipient-side signing workflow for signed-only invoices.
    *
-   * Public wrapper over _receiveBase() for local workflows where the invoice
-   * is held in plaintext — no encrypted envelope to re-wrap.
+   * This is the plaintext counterpart to {@link GeneralInvoice.receive}.
+   * It applies the same recipient/allowlist protections without performing
+   * envelope re-encryption.
    *
-   * Use receive() for all encrypted transport invoices (the cloud path).
-   * Use countersign() for local, offline, or tooling workflows where the
-   * invoice is signed-only.
-   *
-   * Enforces the same recipient invariants as receive():
-   *   - Invoice must be "signed-only"
-   *   - Invoice must not be sealed
-   *   - An expectedSigners allowlist must exist
-   *   - signerKey must be on that allowlist
-   *   - signerKey must NOT be the issuer (allowlistSignerId)
-   *   - signerKey must be unlocked and have signing keys
-   *
-   * @param updatedInvoice   The mutated GeneralInvoice.
-   * @param signerKey        Unlocked MajikKey belonging to the recipient.
+   * @param updatedInvoice - Updated underlying GeneralInvoice.
+   * @param signerKey - Authorized recipient signing key.
+   * @returns A new signed-only MajikInvoice containing the recipient signature.
+   * @throws {@link MajikInvoiceError} When the invoice is encrypted.
+   * @throws {@link MajikInvoiceSignatureError} When recipient authorization fails.
    */
   async countersign(
     updatedInvoice: GeneralInvoice,
@@ -1234,31 +1615,38 @@ export class MajikInvoice {
   }
 
   // ==========================================================================
-  // ── MODE SETTING ───────────────────────────────────────────────────────────
+  // ── MODE SETTING
   // ==========================================================================
 
   /**
-   * Set the mode of this invoice, returning a NEW MajikInvoice.
-   * The original is untouched. All existing signatures are cleared — re-sign
-   * after conversion.
+   * Convert this invoice between supported payload modes.
    *
-   * - "signed-only"          → requires decryptKey if currently encrypted
-   * - "encrypted-and-signed" → requires recipientKeys
+   * Use this as the general-purpose mode conversion API.
    *
-   * Optionally re-sign immediately by providing signerKey.
+   * Conversions:
    *
-   * @throws {MajikInvoiceError}          if the target mode is already active
-   * @throws {MajikInvoiceKeyError}       if required keys are missing or locked
-   * @throws {MajikInvoiceEncryptionError} if decryption or encryption fails
+   * - signed-only → encrypted-and-signed
+   *   Requires recipients and recipient public routing keys.
+   *
+   * - encrypted-and-signed → signed-only
+   *   Requires a decryption key.
+   *
+   * Optional signing can be performed immediately after conversion.
+   *
+   * @param targetMode - Desired invoice payload mode.
+   * @param options - Conversion, encryption, decryption, signing, allowlist,
+   * and routing configuration.
+   * @returns A new invoice in the requested mode.
+   * @throws {@link MajikInvoiceError} When the invoice is already in the target mode.
+   * @throws {@link MajikInvoiceKeyError} When conversion prerequisites are missing.
+   * @throws {@link MajikInvoiceEncryptionError} When conversion requires
+   * encryption/decryption and the cryptographic operation fails.
    */
   async setMode(
     targetMode: MajikInvoiceMode,
     options: {
-      /** Required when converting TO "encrypted-and-signed" */
       recipients?: MajikRecipient[];
-      /** Required when converting FROM "encrypted-and-signed" */
       decryptKey?: MajikKey;
-      /** Optional — re-signs the converted invoice immediately */
       signerKey?: MajikKey;
       expectedSigners?: ExpectedSigner[];
       recipientPublicKeys?: MajikKeyAddress[];
@@ -1288,6 +1676,7 @@ export class MajikInvoice {
           `recipientPublicKeys are required when converting to "encrypted-and-signed" mode.`,
         );
       }
+
       return this.toEncrypted(
         options.recipients,
         options.recipientPublicKeys,
@@ -1306,6 +1695,7 @@ export class MajikInvoice {
           `decryptKey is required when converting from "encrypted-and-signed" to "signed-only".`,
         );
       }
+
       return this.toSignedOnly(options.decryptKey, options.signerKey, {
         dropSignatures: dropSignatures,
         expectedSigners: dropSignatures ? options.expectedSigners : undefined,
@@ -1318,12 +1708,11 @@ export class MajikInvoice {
   // ── Quick-access wrappers ─────────────────────────────────────────────────
 
   /**
-   * Convert to "encrypted-and-signed" mode.
-   * Thin wrapper over {@link setMode}.
+   * Convenience wrapper for converting the invoice to encrypted-and-signed mode.
    *
-   * @throws {MajikInvoiceError}           if already encrypted
-   * @throws {MajikInvoiceKeyError}        if recipientKeys are missing or locked
-   * @throws {MajikInvoiceEncryptionError} if encryption fails
+   * @param recipients - ML-KEM recipients for the encrypted payload.
+   * @param signerKey - Optional key used to sign immediately.
+   * @returns A new encrypted-and-signed invoice.
    */
   async encrypt(
     recipients: MajikRecipient[],
@@ -1333,12 +1722,13 @@ export class MajikInvoice {
   }
 
   /**
-   * Convert to "signed-only" (plaintext) mode.
-   * Thin wrapper over {@link setMode}.
+   * Convenience wrapper for converting the invoice to signed-only mode.
    *
-   * @throws {MajikInvoiceError}           if already signed-only
-   * @throws {MajikInvoiceKeyError}        if decryptKey is missing or locked
-   * @throws {MajikInvoiceEncryptionError} if decryption fails
+   * The unusual method name is retained for API compatibility.
+   *
+   * @param decryptKey - Key used to decrypt the current encrypted payload.
+   * @param signerKey - Optional key used to sign the resulting plaintext invoice.
+   * @returns A new signed-only invoice.
    */
   async decrypt_mode(
     decryptKey: MajikKey,
@@ -1348,10 +1738,20 @@ export class MajikInvoice {
   }
 
   // ==========================================================================
-  // ── ENCRYPTION & DECRYPTION ────────────────────────────────────────────────
+  // ── ENCRYPTION & DECRYPTION
   // ==========================================================================
 
-  // 2. withDecryptedCache — clean way to stamp cache onto a new instance
+  /**
+   * Attach a decrypted GeneralInvoice to the runtime cache of a rebuilt instance.
+   *
+   * The cached plaintext is intentionally runtime-only and is not serialized
+   * into the persisted envelope.
+   *
+   * @param invoice - Decrypted GeneralInvoice to cache.
+   * @param decryptedBy - Fingerprint of the key used to decrypt it.
+   * @returns A new MajikInvoice containing the runtime decrypted cache.
+   * @internal
+   */
   withDecryptedCache(
     invoice: GeneralInvoice,
     decryptedBy: string,
@@ -1366,13 +1766,22 @@ export class MajikInvoice {
   }
 
   /**
-   * Decrypt an encrypted invoice using the recipient's MajikKey.
-   * Result is cached on the instance for subsequent `.invoice` access.
-   * Returns the decrypted GeneralInvoice.
+   * Decrypt an encrypted invoice using an authorized MajikKey.
    *
-   * @throws {MajikInvoiceError} if invoice is not encrypted
-   * @throws {MajikInvoiceKeyError} if key is locked or has no ML-KEM secret key
-   * @throws {MajikInvoiceEncryptionError} if decryption fails (wrong key or corrupted data)
+   * Successful decryption creates a runtime cache so subsequent access to
+   * `.invoice` can reuse the decrypted GeneralInvoice without repeating the
+   * envelope decryption operation for the same key.
+   *
+   * The returned `instance` contains the cached runtime state.
+   *
+   * Signed-only invoices are not decryptable because their payload is already
+   * plaintext.
+   *
+   * @param key - Unlocked MajikKey containing the required ML-KEM secret key.
+   * @returns Decrypted invoice plus the instance carrying its runtime cache.
+   * @throws {@link MajikInvoiceError} When the invoice is signed-only.
+   * @throws {@link MajikInvoiceKeyError} When the key is locked or lacks ML-KEM.
+   * @throws {@link MajikInvoiceEncryptionError} When decryption fails.
    */
   async decrypt(key: MajikKey): Promise<InvoiceDecryptionResult> {
     if (this.mode === "signed-only") {
@@ -1381,7 +1790,7 @@ export class MajikInvoice {
       );
     }
 
-    // Return cached result if the same key decrypted this session
+    // Return cached result when this exact key already decrypted the invoice.
     if (this._decrypted && this._decrypted.decryptedBy === key.fingerprint) {
       return {
         instance: this,
@@ -1418,19 +1827,31 @@ export class MajikInvoice {
   }
 
   /**
-   * Clear the decrypted cache.
-   * After calling this, .invoice will throw again until decrypt() is called.
+   * Clear the in-memory decrypted invoice cache.
+   *
+   * This does not modify the serialized payload, signatures, or integrity
+   * metadata. It only removes runtime plaintext from the current instance.
+   *
+   * For encrypted invoices, subsequent `.invoice` access requires another
+   * successful call to {@link decrypt}.
+   *
+   * @returns Nothing.
    */
   clearDecryptedCache(): void {
     this._decrypted = undefined;
   }
 
   /**
-   * Check whether a given MajikKey can decrypt this invoice.
+   * Check whether a key appears in the encrypted envelope's recipient list.
    *
-   * For single-recipient envelopes: checks if the key's fingerprint matches.
-   * For group envelopes: checks if the fingerprint is in the recipient list.
-   * Does not attempt actual decryption — fingerprint check only.
+   * This performs a fingerprint membership check only. It does not attempt
+   * actual decryption and therefore does not prove that the key can successfully
+   * decrypt the payload.
+   *
+   * Signed-only invoices always return `false`.
+   *
+   * @param key - Candidate decryption key.
+   * @returns `true` when the key fingerprint appears among the envelope recipients.
    */
   canDecrypt(key: MajikKey): boolean {
     if (this.mode === "signed-only") return false;
@@ -1439,22 +1860,30 @@ export class MajikInvoice {
   }
 
   // ==========================================================================
-  // ── SIGNING ────────────────────────────────────────────────────────────────
+  // ── SIGNING
   // ==========================================================================
 
   /**
-   * Sign this invoice with the provided MajikKey.
-   * Returns a NEW MajikInvoice with the signature appended.
-   * The original is untouched.
+   * Add or replace a signature from a MajikKey.
    *
-   * If this is the first signature and expectedSigners are provided,
-   * an allowlist is established and the signer becomes the issuer.
+   * The signature is created over the invoice's canonical content commitment,
+   * not over the encrypted envelope bytes themselves.
    *
-   * Re-signing with the same key overwrites that signer's existing entry.
+   * When an `expectedSigners` allowlist is supplied for an unsigned invoice,
+   * the allowlist becomes part of the signature metadata and the first signer
+   * establishes the issuer identity.
    *
-   * @throws {MajikInvoiceKeyError} if key is locked or has no signing keys
-   * @throws {MajikInvoiceSealError} if the invoice is sealed
-   * @throws {MajikInvoiceSignatureError} if signing fails
+   * Signing the same key again replaces that signer's existing signature entry.
+   *
+   * A sealed invoice cannot be signed.
+   *
+   * @param key - Unlocked MajikKey with signing capabilities.
+   * @param options - Optional expected-signer allowlist and signature timestamp.
+   * @returns A new MajikInvoice containing the signature.
+   * @throws {@link MajikInvoiceKeyError} When the key is locked or has no signing keys.
+   * @throws {@link MajikInvoiceSealError} When the invoice is sealed.
+   * @throws {@link MajikInvoiceSignatureError} When signer authorization or
+   * signature creation fails.
    */
   async sign(
     key: MajikKey,
@@ -1472,7 +1901,7 @@ export class MajikInvoice {
       );
     }
 
-    // Allowlist check — if an allowlist exists, verify this key is on it
+    // Existing allowlists restrict signing membership.
     if (
       this.integrity.expectedSigners &&
       this.integrity.expectedSigners.length > 0
@@ -1488,14 +1917,13 @@ export class MajikInvoice {
       }
     }
 
-    // Compute canonical content for signing
+    // Sign the canonical identity/content commitment.
     const contentBytes = await canonicalBytesForSigning(
       this.integrity.contentHash,
       this.id,
     );
 
-    // Compute allowlist hash if expectedSigners are being set now.
-    // MajikSignatureJSON.allowlistHash is base64 (SHA-256 of canonical allowlist JSON).
+    // Expected signer configuration is committed into the signature metadata.
     let allowlistHash: string | undefined;
     const signers = options?.expectedSigners ?? this.integrity.expectedSigners;
     if (signers && signers.length > 0) {
@@ -1508,7 +1936,7 @@ export class MajikInvoice {
         allowlistHash,
       });
 
-      // Replace existing signature from same signer, or append
+      // Replace the existing signature from the same signer, or append a new one.
       const existingIdx = this.integrity.signatures.findIndex(
         (s) => s.signerId === key.fingerprint,
       );
@@ -1543,14 +1971,28 @@ export class MajikInvoice {
   }
 
   /**
-   * Seal this invoice, preventing any further signatures.
-   * Only the issuer (allowlistSignerId) may seal.
-   * If no allowlist is set, any current signer may seal.
-   * Returns a NEW MajikInvoice. The original is untouched.
+   * Cryptographically seal the invoice.
    *
-   * @throws {MajikInvoiceKeyError} if key is locked
-   * @throws {MajikInvoiceSealError} if already sealed or key is not the issuer
-   * @throws {MajikInvoiceSignatureError} if no signatures exist to seal
+   * Sealing marks the current signature set as final and prevents subsequent
+   * signatures from being added.
+   *
+   * When an allowlist issuer exists, only that issuer may seal. Without an
+   * explicit issuer identity, the key must already be one of the invoice's
+   * signers.
+   *
+   * The resulting seal contains:
+   *
+   * - signer identity of the sealer
+   * - seal timestamp
+   * - SHA3-512 seal hash over the current signature set and timestamp
+   *
+   * @param key - Key authorized to seal the invoice.
+   * @param options - Optional explicit seal timestamp.
+   * @returns A new sealed MajikInvoice.
+   * @throws {@link MajikInvoiceKeyError} When the key is locked.
+   * @throws {@link MajikInvoiceSealError} When already sealed or the caller is
+   * not authorized to seal.
+   * @throws {@link MajikInvoiceSignatureError} When no signatures exist.
    */
   async seal(
     key: MajikKey,
@@ -1568,7 +2010,7 @@ export class MajikInvoice {
       );
     }
 
-    // If an allowlist issuer exists, only they can seal
+    // An established allowlist issuer has exclusive sealing authority.
     if (
       this.integrity.allowlistSignerId &&
       this.integrity.allowlistSignerId !== key.fingerprint
@@ -1579,7 +2021,7 @@ export class MajikInvoice {
       );
     }
 
-    // If no allowlist issuer, key must be among the existing signers
+    // Without a designated issuer, the sealer must already be a signer.
     if (
       !this.integrity.allowlistSignerId &&
       !this.integrity.signatures.some((s) => s.signerId === key.fingerprint)
@@ -1591,14 +2033,12 @@ export class MajikInvoice {
 
     const sealTimestamp = options?.timestamp ?? new Date().toISOString();
 
-    // Compute the seal hash using full signatory info (ed/ml public keys)
-    // for stronger tamper-evidence. computeSealHashAsync uses SHA3-512.
+    // Seal hash covers full signature information for tamper evidence.
     const sealHash = await computeSealHashAsync(
       this.integrity.signatures,
       sealTimestamp,
     );
 
-    // SealInfo shape matches @majikah/majik-signature — three fields only.
     const sealInfo: SealInfo = {
       sealedBy: key.fingerprint,
       sealTimestamp,
@@ -1615,14 +2055,20 @@ export class MajikInvoice {
   }
 
   // ==========================================================================
-  // ── SIGNATURE VERIFICATION ─────────────────────────────────────────────────
+  // ── SIGNATURE VERIFICATION
   // ==========================================================================
 
   /**
-   * Verify all attached signatures.
-   * Returns one VerificationResult per signature.
+   * Verify every signature currently attached to the invoice.
    *
-   * @throws {MajikInvoiceSignatureError} if no signatures exist
+   * One verification result is returned for each signature, preserving the
+   * signature collection's order.
+   *
+   * Signature verification validates the signature over the canonical content
+   * commitment; it does not by itself validate the entire invoice structure.
+   *
+   * @returns One {@link VerificationResult} per signature.
+   * @throws {@link MajikInvoiceSignatureError} When the invoice has no signatures.
    */
   async verifySignatures(): Promise<VerificationResult[]> {
     if (this.integrity.signatures.length === 0) {
@@ -1647,7 +2093,6 @@ export class MajikInvoice {
           valid: false,
           signerId: sigJSON.signerId,
           contentHash: sigJSON.contentHash,
-          // timestamp is non-optional on VerificationResult — use the envelope's value
           timestamp: sigJSON.timestamp,
           reason: `Verification threw: ${err instanceof Error ? err.message : String(err)}`,
         });
@@ -1658,9 +2103,12 @@ export class MajikInvoice {
   }
 
   /**
-   * Verify the signature of a specific signer.
+   * Verify the signature belonging to one specific signer.
    *
-   * @throws {MajikInvoiceSignatureError} if no signature from that signer exists
+   * @param signerId - Fingerprint of the signer whose signature should be verified.
+   * @returns Verification result for the requested signer.
+   * @throws {@link MajikInvoiceSignatureError} When no signature from the
+   * specified signer exists or verification fails.
    */
   async verifySignature(signerId: string): Promise<VerificationResult> {
     const sigJSON = this.integrity.signatures.find(
@@ -1691,8 +2139,18 @@ export class MajikInvoice {
   }
 
   /**
-   * Verify the seal hash without verifying individual signatures.
-   * Returns invalid if the invoice is not sealed.
+   * Verify the invoice seal hash.
+   *
+   * This verifies that the current signature set still matches the hash
+   * embedded in `sealInfo`.
+   *
+   * It does not independently verify each signature; use
+   * {@link verifySignatures} for that.
+   *
+   * @returns Seal verification result.
+   *
+   * A non-sealed invoice returns an invalid result with the reason
+   * `"Invoice is not sealed."`.
    */
   async verifySeal(): Promise<SealVerificationResult> {
     if (!this.integrity.isSealed || !this.integrity.sealInfo) {
@@ -1723,12 +2181,24 @@ export class MajikInvoice {
   }
 
   // ==========================================================================
-  // ── CAPABILITY CHECKS ──────────────────────────────────────────────────────
+  // ── CAPABILITY CHECKS
   // ==========================================================================
 
   /**
-   * Check whether a key is permitted to sign this invoice.
-   * Accounts for seal status, allowlist membership, and key capability.
+   * Determine whether a key is currently permitted to sign the invoice.
+   *
+   * The check considers:
+   *
+   * - whether the invoice is sealed
+   * - whether the key has signing keys
+   * - whether the key is unlocked
+   * - whether an expected-signer allowlist exists
+   * - whether the key is included in that allowlist
+   *
+   * This is a capability preflight check and does not perform signing.
+   *
+   * @param key - Candidate signing key.
+   * @returns Object containing permission state and, when denied, a reason.
    */
   canSign(key: MajikKey): { permitted: boolean; reason?: string } {
     if (this.integrity.isSealed) {
@@ -1768,7 +2238,18 @@ export class MajikInvoice {
   }
 
   /**
-   * Check whether a key is permitted to seal this invoice.
+   * Determine whether a key is currently permitted to seal the invoice.
+   *
+   * The check considers:
+   *
+   * - whether the invoice is already sealed
+   * - whether at least one signature exists
+   * - whether the key is unlocked
+   * - whether a designated issuer exists
+   * - whether the candidate key is that issuer or an existing signer
+   *
+   * @param key - Candidate sealing key.
+   * @returns Object containing permission state and, when denied, a reason.
    */
   canSeal(key: MajikKey): { permitted: boolean; reason?: string } {
     if (this.integrity.isSealed) {
@@ -1805,7 +2286,10 @@ export class MajikInvoice {
   }
 
   /**
-   * Check whether a key has already signed this invoice.
+   * Check whether a specific key already has a signature on the invoice.
+   *
+   * @param key - Candidate signer.
+   * @returns `true` when the key fingerprint appears in the signature set.
    */
   hasSigned(key: MajikKey): boolean {
     return this.integrity.signatures.some(
@@ -1814,8 +2298,11 @@ export class MajikInvoice {
   }
 
   /**
-   * Returns the list of expected signers who have not yet signed.
-   * Returns an empty array if no allowlist is set or all have signed.
+   * Get expected signers who have not yet signed.
+   *
+   * When no allowlist exists, the result is an empty array.
+   *
+   * @returns Expected signer entries that are still pending.
    */
   get pendingSigners(): ExpectedSigner[] {
     if (!this.integrity.expectedSigners) return [];
@@ -1826,7 +2313,12 @@ export class MajikInvoice {
   }
 
   /**
-   * Whether all expected signers have signed (true even if no allowlist is set).
+   * Determine whether the invoice has satisfied its expected signing set.
+   *
+   * When no explicit allowlist exists, at least one signature is sufficient
+   * to report a fully signed state.
+   *
+   * @returns `true` when the invoice has reached its expected signer state.
    */
   get isFullySigned(): boolean {
     if (
@@ -1839,17 +2331,40 @@ export class MajikInvoice {
   }
 
   // ==========================================================================
-  // ── VALIDATION ─────────────────────────────────────────────────────────────
+  // ── VALIDATION
   // ==========================================================================
 
   /**
-   * Validate the structural integrity of this MajikInvoice.
-   * Does NOT verify cryptographic signatures — call verifySignatures() for that.
+   * Validate the structural integrity of the MajikInvoice envelope.
+   *
+   * This checks envelope structure and required fields but does **not**
+   * cryptographically verify attached signatures.
+   *
+   * Use {@link verifySignatures} and {@link verifySeal} for cryptographic
+   * verification.
+   *
+   * @returns Structural validation result containing validity and field errors.
    */
   validate(): MajikInvoiceValidationResult {
     return this._validateStructure();
   }
 
+  /**
+   * Perform internal structural validation of the envelope.
+   *
+   * Validation covers:
+   *
+   * - invoice ID
+   * - supported mode
+   * - public summary fields
+   * - mode-specific payload structure
+   * - integrity content hash
+   * - supported hash algorithm
+   * - seal metadata requirements
+   *
+   * @returns Structural validation result.
+   * @internal
+   */
   private _validateStructure(): MajikInvoiceValidationResult {
     const errors: Array<{ field: string; message: string }> = [];
 
@@ -1940,11 +2455,13 @@ export class MajikInvoice {
   }
 
   /**
-   * Securely clears runtime-sensitive decrypted state from memory.
+   * Remove the runtime decrypted cache from memory.
    *
-   * - Only affects in-memory cache
-   * - Does NOT modify payload, signatures, or integrity
-   * - No-op for signed-only invoices
+   * For encrypted invoices this returns the instance to a locked state.
+   *
+   * This does not modify serialized invoice data.
+   *
+   * @returns The current instance for convenient chaining.
    */
   secureLock(): this {
     if (this.mode === "encrypted-and-signed") {
@@ -1955,18 +2472,21 @@ export class MajikInvoice {
   }
 
   // ==========================================================================
-  // ── Batch Operations ──────────────────────────────────────────────────────────
+  // ── BATCH OPERATIONS
   // ==========================================================================
 
   /**
-   * Decrypt an array of MajikInvoice instances concurrently.
-   * Signed-only invoices are passed through unchanged (they need no decryption).
-   * Encrypted invoices that cannot be decrypted with the provided key are
-   * collected in the errors array and excluded from `decrypted`.
+   * Decrypt multiple invoices concurrently.
    *
-   * @param invoices  - Array of MajikInvoice to process
-   * @param key       - An unlocked MajikKey authorised to decrypt the invoices
-   * @returns BatchDecryptResult
+   * Signed-only invoices pass through unchanged.
+   * Encrypted invoices are decrypted using the supplied key when the key is
+   * listed as an envelope recipient.
+   *
+   * Individual failures are collected instead of aborting the entire batch.
+   *
+   * @param invoices - Invoices to process.
+   * @param key - Unlocked key authorized to decrypt applicable invoices.
+   * @returns Batch decryption result with successes and individual failures.
    */
   static async batchDecrypt(
     invoices: MajikInvoice[],
@@ -1984,7 +2504,7 @@ export class MajikInvoice {
           );
         }
         const { instance } = await inv.decrypt(key);
-        return instance; // ← was: return inv (original, no cache)
+        return instance;
       }),
     );
 
@@ -2012,13 +2532,13 @@ export class MajikInvoice {
   }
 
   /**
-   * Clears the in-memory decrypted cache from all encrypted invoices.
-   * Signed-only invoices are skipped (nothing to lock).
+   * Clear the decrypted runtime cache from every encrypted invoice in a batch.
    *
-   * Call this after you're done with a batch to minimise plaintext in memory.
+   * Signed-only invoices are counted as skipped because they do not maintain
+   * an encrypted runtime cache.
    *
-   * @param invoices - Array of MajikInvoice to lock
-   * @returns BatchLockResult with counts of locked vs skipped
+   * @param invoices - Invoices whose runtime plaintext should be cleared.
+   * @returns Counts of locked and skipped invoices.
    */
   static batchLock(invoices: MajikInvoice[]): BatchLockResult {
     let locked = 0;
@@ -2037,21 +2557,27 @@ export class MajikInvoice {
   }
 
   /**
-   * Scans an array of MajikInvoice and marks any whose due date has passed
-   * and whose current status allows an "overdue" transition.
+   * Detect invoices whose due dates have passed and mark them as overdue.
    *
-   * For each candidate:
-   *   - If signed-only, or already decrypted: process directly.
-   *   - If encrypted and decryptKey is provided: attempt decrypt first.
-   *   - If encrypted and no decryptKey: skip (or throw if strict=true).
+   * Signed-only and already-decrypted encrypted invoices can be evaluated
+   * immediately.
    *
-   * Returns an OverdueMarkResult. The `marked` array contains NEW GeneralInvoice
-   * instances from .markAsOverdue() — callers are responsible for reissuing
-   * the MajikInvoice and persisting.
+   * Encrypted invoices may optionally be decrypted with `decryptKey`.
+   * When decryption is unavailable:
    *
-   * @param invoices    - Invoices to check
-   * @param options.strict     - Throw on encrypted+inaccessible instead of skipping (default: false)
-   * @param options.decryptKey - Optional key; used to decrypt encrypted invoices before checking
+   * - `strict: false` records the invoice as skipped
+   * - `strict: true` throws instead
+   *
+   * Marked invoices are returned as new MajikInvoice instances. Persistence
+   * and any subsequent re-signing are the caller's responsibility.
+   *
+   * @param invoices - Invoices to inspect.
+   * @param options - Strictness and optional decryption key.
+   * @returns Overdue processing result.
+   * @throws {@link MajikInvoiceKeyError} In strict mode when encrypted invoice
+   * access fails.
+   * @throws {@link MajikInvoiceError} In strict mode when encrypted access is
+   * unavailable.
    */
   static async autoMarkOverdue(
     invoices: MajikInvoice[],
@@ -2075,7 +2601,7 @@ export class MajikInvoice {
       } else if (inv.hasDecryptedCache) {
         gi = inv.invoice;
       } else if (decryptKey) {
-        // Attempt decrypt — skip if this key isn't authorised
+        // Attempt decrypt — skip if this key is not authorized.
         if (!inv.canDecrypt(decryptKey)) {
           if (strict) {
             throw new MajikInvoiceKeyError(
@@ -2094,7 +2620,7 @@ export class MajikInvoice {
           continue;
         }
       } else {
-        // Encrypted, no key provided
+        // Encrypted but no decryption key was supplied.
         if (strict) {
           throw new MajikInvoiceError(
             `batchAutoMarkOverdue (strict): Invoice "${inv.id}" is encrypted and no decryptKey was provided.`,
@@ -2116,11 +2642,11 @@ export class MajikInvoice {
         continue;
       }
 
-      // ── 4. Mark overdue — force=true because we already checked the date ──
+      // ── 4. Mark overdue after explicitly validating the date condition ─────
       const updatedGi = gi.markAsOverdue(true);
 
-      // Reissue the MajikInvoice shell with updated GeneralInvoice
-      // (drops signatures — caller must re-sign)
+      // Rebuild the MajikInvoice shell. Financial content is unchanged,
+      // so the existing content commitment can be carried forward.
       const updatedMajik = inv._reissueFromMutation(updatedGi);
       marked.push(updatedMajik);
     }
@@ -2129,17 +2655,23 @@ export class MajikInvoice {
   }
 
   // ==========================================================================
-  // ── Dashboard Stats ──────────────────────────────────────────────────────────
+  // ── DASHBOARD STATISTICS
   // ==========================================================================
 
   /**
-   * Compute dashboard statistics across an array of MajikInvoice.
-   * Encrypted invoices that haven't been decrypted are counted in totals
-   * using their public summary only — detailed financials (tax, discount, etc.)
-   * require the decrypted GeneralInvoice and are excluded for locked invoices.
+   * Calculate aggregate dashboard statistics across a collection of invoices.
    *
-   * @param invoices        - The invoice population to analyse
-   * @param options.dueSoonDays - Window for dueSoonCount (default: 7)
+   * The method is designed to operate on mixed locked/unlocked collections.
+   *
+   * For encrypted invoices without a decrypted cache:
+   *
+   * - public-summary metrics remain available
+   * - detailed financial metrics requiring `GeneralInvoice` are omitted from
+   *   the detailed aggregation
+   *
+   * @param invoices - Invoice collection to analyze.
+   * @param options - Dashboard calculation options.
+   * @returns Aggregate invoice statistics.
    */
   static computeDashboardStats(
     invoices: MajikInvoice[],
@@ -2177,7 +2709,7 @@ export class MajikInvoice {
     let withholdingTotal = 0;
     let netPayable = 0;
     let discountGiven = 0;
-    let weightedTaxRate = 0; // numerator for weighted avg
+    let weightedTaxRate = 0;
     let weightedTaxBase = 0;
     let paidCount = 0;
     let partialCount = 0;
@@ -2191,7 +2723,8 @@ export class MajikInvoice {
     let newestDate: string | null = null;
 
     for (const inv of invoices) {
-      // ── Detailed financials — only available when plaintext is accessible ────
+      // Detailed financials are available only when the inner invoice
+      // can currently be reconstructed in plaintext.
       let gi: GeneralInvoice | null = null;
       try {
         if (inv.mode === "signed-only" || inv.hasDecryptedCache) {
@@ -2272,7 +2805,7 @@ export class MajikInvoice {
           weightedTaxBase += gi.subtotalAmount;
         }
 
-        // Days to first payment
+        // Days from issue date to first recorded payment.
         if (gi.proofOfPayments.length > 0 && gi.issueDate) {
           const issueMs = new Date(gi.issueDate).getTime();
           const firstPayMs = new Date(
@@ -2282,7 +2815,7 @@ export class MajikInvoice {
           if (days >= 0) daysToPaymentList.push(days);
         }
 
-        // Tax breakdown by type
+        // Aggregate additive taxes by type.
         for (const entry of gi.taxBreakdown()) {
           if (entry.behaviour !== "additive") continue;
           const existing = taxTypeMap.get(entry.taxType) ?? {
@@ -2377,9 +2910,25 @@ export class MajikInvoice {
   }
 
   // ==========================================================================
-  // ── Binary ──────────────────────────────────────────────────────────
+  // ── BINARY
   // ==========================================================================
 
+  /**
+   * Serialize the complete MajikInvoice into the compact MJKI binary format.
+   *
+   * The binary container consists of:
+   *
+   * 1. MJKI magic bytes
+   * 2. binary format version
+   * 3. reserved/flag bytes
+   * 4. big-endian JSON payload length
+   * 5. UTF-8 encoded JSON payload
+   *
+   * The underlying invoice data remains the same as {@link toJSON}; this
+   * method changes only the transport representation.
+   *
+   * @returns Binary invoice envelope as an `ArrayBuffer`.
+   */
   toBinary(): ArrayBuffer {
     const json = encoder.encode(JSON.stringify(this.toJSON()));
 
@@ -2406,7 +2955,17 @@ export class MajikInvoice {
     return buffer.buffer;
   }
 
-  /** Parse from binary blob. */
+  /**
+   * Parse a MajikInvoice from the MJKI binary format.
+   *
+   * The binary header and declared payload length are validated before the
+   * embedded JSON is decoded and passed through {@link MajikInvoice.fromJSON}.
+   *
+   * @param blob - Binary MJKI representation.
+   * @returns Deserialized MajikInvoice.
+   * @throws {@link MajikInvoiceSerializationError} When the binary header,
+   * version, length, or JSON payload is invalid.
+   */
   static fromBinary(blob: ArrayBuffer): MajikInvoice {
     const bytes = new Uint8Array(blob);
     const view = new DataView(blob);
@@ -2463,9 +3022,26 @@ export class MajikInvoice {
   }
 
   // ==========================================================================
-  // ── SERIALIZATION ──────────────────────────────────────────────────────────
+  // ── SERIALIZATION
   // ==========================================================================
 
+  /**
+   * Serialize the envelope into its canonical JSON transport representation.
+   *
+   * The serialized form includes:
+   *
+   * - envelope identity and version
+   * - payload mode
+   * - public summary
+   * - payload
+   * - integrity/signature metadata
+   * - timestamps
+   * - recipient routing addresses
+   *
+   * Runtime decrypted cache is intentionally excluded.
+   *
+   * @returns JSON-safe MajikInvoice representation.
+   */
   toJSON(): MajikInvoiceJSON {
     return {
       version: this.version,
@@ -2481,8 +3057,27 @@ export class MajikInvoice {
   }
 
   /**
-   * Generates a MajikahInvoiceJSON for cloud routing.
-   * Ensures ownership and routing fields are present.
+   * Convert the invoice into the cloud-routing `MajikahInvoiceJSON` format.
+   *
+   * This method adds the routing/ownership fields expected by the cloud layer:
+   *
+   * - `user_id`
+   * - `account_id`
+   * - recipient routing addresses
+   * - sender public key
+   * - `sent_at`
+   * - public invoice status
+   *
+   * The invoice is securely locked before the serialized routing payload is
+   * returned.
+   *
+   * Encrypted invoices are required unless `forceSignedOnly` is explicitly set.
+   *
+   * @param sender - Public sender key/address used for cloud routing.
+   * @param options - Optional ownership/routing overrides.
+   * @returns Cloud-oriented serialized invoice representation.
+   * @throws {@link MajikInvoiceError} When required cloud routing information
+   * is missing or encryption requirements are not satisfied.
    */
   toMajikahInvoiceJSON(
     sender: MajikKeyAddress,
@@ -2536,6 +3131,23 @@ export class MajikInvoice {
     };
   }
 
+  /**
+   * Reconstruct a MajikInvoice from its JSON or cloud-routing JSON form.
+   *
+   * The method accepts either:
+   *
+   * - an already parsed object
+   * - a JSON string
+   * - a cloud `MajikahInvoiceJSON` containing compatible routing fields
+   *
+   * After reconstruction, the resulting envelope is structurally validated.
+   * Cryptographic signatures are not automatically verified.
+   *
+   * @param json - Serialized MajikInvoice data or its JSON string.
+   * @returns Reconstructed MajikInvoice instance.
+   * @throws {@link MajikInvoiceSerializationError} When parsing, required
+   * fields, or structural validation fail.
+   */
   static fromJSON(
     json: MajikInvoiceJSON | MajikahInvoiceJSON | string,
   ): MajikInvoice {
@@ -2548,7 +3160,7 @@ export class MajikInvoice {
         );
       }
 
-      // Map cloud fields back to standard properties if coming from MajikahInvoiceJSON
+      // Map cloud ownership fields back to the internal representation.
       const parsedCloud = parsed as any;
       const resolvedUserId = parsedCloud.user_id ?? parsed.userId;
       const resolvedAccountId = parsedCloud.account_id ?? parsed.accountId;
@@ -2586,35 +3198,60 @@ export class MajikInvoice {
       );
     }
   }
+
+  /**
+   * Serialize the invoice to a JSON string.
+   *
+   * @param pretty - Whether to indent the resulting JSON for readability.
+   * @returns Serialized invoice JSON.
+   */
   toString(pretty = false): string {
     return JSON.stringify(this.toJSON(), null, pretty ? 2 : 0);
   }
 
   // ==========================================================================
-  // ── PRIVATE HELPERS ────────────────────────────────────────────────────────
+  // ── PRIVATE HELPERS
   // ==========================================================================
 
+  /**
+   * Rebuild the MajikInvoice after a mutation to its underlying
+   * {@link GeneralInvoice}.
+   *
+   * The `recomputeHash` option controls whether the modification represents
+   * cryptographically committed content changes.
+   *
+   * - `false`
+   *   Preserve the existing content hash and signature set. Intended for
+   *   lifecycle/payment mutations that are intentionally excluded from the
+   *   canonical signable invoice.
+   *
+   * - `true`
+   *   Recompute the canonical content hash and clear signatures/seal state.
+   *   Intended for genuine financial/document changes.
+   *
+   * Encrypted invoices cannot use this helper because changing their
+   * underlying payload requires recipient/re-encryption context. Use
+   * {@link reissue} for those cases.
+   *
+   * @param updatedInvoice - Updated underlying GeneralInvoice.
+   * @param options - Hash recomputation behaviour.
+   * @returns Rebuilt MajikInvoice.
+   * @internal
+   */
   protected _reissueFromMutation(
     updatedInvoice: GeneralInvoice,
     options: {
       /**
-       * When true, recomputes contentHash from the updated invoice.
-       * Use this ONLY for genuine financial edits (reissue() path).
-       * Default: false — preserves existing contentHash so signatures remain valid.
+       * Recompute the content hash from the updated invoice when `true`.
+       * Preserve the existing hash when `false`.
        */
       recomputeHash?: boolean;
     } = {},
   ): MajikInvoice {
-    // NOTE:
-    // - drops signatures (correct for financial edits)
-    // - preserves mode
-    // - DOES NOT auto-sign (caller decides)
-
+    // Lifecycle/status/payment mutations can preserve the current content
+    // commitment; genuine financial changes require a new commitment.
     const publicSummary = MajikInvoice._buildPublicSummary(updatedInvoice);
 
-    // Only recompute the hash when the financial content has genuinely changed.
-    // Lifecycle mutations (status, payments, notes) must carry the existing hash
-    // forward so that attached signatures remain verifiable.
     const contentHash = options.recomputeHash
       ? sha256Hex(updatedInvoice.toCanonicalBytes())
       : this.integrity.contentHash;
@@ -2632,14 +3269,13 @@ export class MajikInvoice {
       invoice: updatedInvoice.toJSON(),
     };
 
-    // For lifecycle mutations (recomputeHash: false), preserve existing signatures.
-    // For financial edits (recomputeHash: true), drop signatures — content changed.
+    // Preserve signatures for non-signable lifecycle mutations; drop them
+    // when the canonical financial content has changed.
     const integrity: IntegrityBlock = {
       contentHash,
       hashAlgorithm: "SHA-256",
       signatures: options.recomputeHash ? [] : [...this.integrity.signatures],
       isSealed: options.recomputeHash ? false : this.integrity.isSealed,
-      // Preserve allowlist metadata regardless
       expectedSigners: this.integrity.expectedSigners,
       allowlistSignerId: this.integrity.allowlistSignerId,
       sealInfo: options.recomputeHash ? undefined : this.integrity.sealInfo,
@@ -2658,7 +3294,15 @@ export class MajikInvoice {
   }
 
   /**
-   * Build the public summary from a GeneralInvoice.
+   * Build the plaintext public summary exposed by every MajikInvoice.
+   *
+   * The summary intentionally contains enough information for display,
+   * routing, and basic indexing without requiring access to the complete
+   * underlying invoice.
+   *
+   * @param invoice - Source GeneralInvoice.
+   * @returns Public invoice summary.
+   * @internal
    */
   private static _buildPublicSummary(
     invoice: GeneralInvoice,
@@ -2679,7 +3323,15 @@ export class MajikInvoice {
   }
 
   /**
-   * Encrypt a GeneralInvoice into a MajikEnvelope and return an EncryptedPayload.
+   * Build an encrypted invoice payload from a GeneralInvoice.
+   *
+   * This delegates to the package encryption service.
+   *
+   * @param invoice - Invoice to encrypt.
+   * @param recipients - ML-KEM recipients.
+   * @param _signerKey - Optional signer key passed through to the encryption layer.
+   * @returns Encrypted payload representation.
+   * @internal
    */
   private static async _buildEncryptedPayload(
     invoice: GeneralInvoice,
@@ -2690,14 +3342,16 @@ export class MajikInvoice {
   }
 
   /**
-   * Derive the canonical bytes used as signing input.
-   * Format: "majik-invoice-v1:" + JSON({ contentHash, id })
-   * This ensures the signature covers both the invoice identity and its content hash.
-   */
-  // canonicalBytesForSigning and sha256Hex are now provided by ./crypto-utils
-  /**
-   * Get the plaintext GeneralInvoice for operations that require it.
-   * Handles signed-only mode and decrypted cache; throws if encrypted and not cached.
+   * Resolve the underlying GeneralInvoice for operations that require
+   * plaintext access.
+   *
+   * Signed-only invoices are reconstructed directly from their payload.
+   * Encrypted invoices require a runtime decrypted cache.
+   *
+   * @param operation - Name of the operation requesting plaintext access.
+   * @returns Underlying GeneralInvoice.
+   * @throws {@link MajikInvoiceError} When an encrypted invoice has not been decrypted.
+   * @internal
    */
   private _requirePlaintextInvoice(operation: string): GeneralInvoice {
     if (this.mode === "signed-only") {
@@ -2713,10 +3367,20 @@ export class MajikInvoice {
         `Call decrypt(key) first.`,
     );
   }
-  // Key assertion helpers moved to ./validators/key-guards
 
   // ── Input validation ──────────────────────────────────────────────────────
 
+  /**
+   * Validate security-specific input required to construct a MajikInvoice.
+   *
+   * General invoice semantics are delegated to {@link GeneralInvoice.create};
+   * this method validates the additional cryptographic/envelope constraints.
+   *
+   * @param input - MajikInvoice creation input.
+   * @throws {@link MajikInvoiceError} When mode or allowlist configuration is invalid.
+   * @throws {@link MajikInvoiceKeyError} When required keys are missing/locked.
+   * @internal
+   */
   private static _assertValidInput(input: MajikInvoiceInput): void {
     const mode = input.mode ?? "signed-only";
 
@@ -2766,22 +3430,34 @@ export class MajikInvoice {
   }
 
   // ==========================================================================
-  // ── CSV EXPORT — add inside the MajikInvoice class body ────────────────────
+  // ── CSV EXPORT
   // ==========================================================================
 
   /**
-   * Export an array of MajikInvoice instances to a single CSV string.
+   * Export multiple MajikInvoice instances as one CSV document.
    *
-   * Behaviour per invoice:
+   * Invoice handling depends on payload accessibility:
    *
-   *   signed-only              → full data row using the GeneralInvoice
-   *   encrypted + decrypted    → full data row using the cached GeneralInvoice
-   *   encrypted + decryptKey   → attempts decryption using provided key
-   *   encrypted + locked       → partial row using only PublicInvoiceSummary
-   *                              fields; all GeneralInvoice-only columns are
-   *                              left blank. The invoice IS still included in
-   *                              the output — it is never silently dropped.
+   * - signed-only
+   *   Full GeneralInvoice-backed export.
    *
+   * - encrypted + decrypted cache
+   *   Full GeneralInvoice-backed export.
+   *
+   * - encrypted + `decryptKey`
+   *   Attempts decryption and exports full data when successful.
+   *
+   * - encrypted + inaccessible
+   *   Produces a partial row using only public-summary-capable columns.
+   *
+   * Locked encrypted invoices are therefore not silently discarded.
+   * Their unavailable columns are reported in `partialExports`.
+   *
+   * Duplicate invoice IDs are removed before export.
+   *
+   * @param invoices - Invoices to export.
+   * @param options - Optional CSV columns and decryption key.
+   * @returns CSV output plus export diagnostics.
    */
   static async batchExportToCSV(
     invoices: MajikInvoice[],
@@ -2799,32 +3475,28 @@ export class MajikInvoice {
     const errors: CSVExportResult["errors"] = [];
     const rows: string[] = [];
 
-    // Header row — always present even if there are zero invoices
+    // Header row is emitted even for an empty invoice collection.
     rows.push(buildCSVHeader(columns));
 
     for (const inv of uniqueInvoices) {
       try {
-        // ── Resolve the GeneralInvoice (or fall back to public summary) ────────
         let generalInvoice: GeneralInvoice | undefined;
 
         if (inv.mode === "signed-only") {
-          // Safe — plaintext is always accessible
           generalInvoice = inv.invoice;
         } else if (inv.hasDecryptedCache) {
-          // Encrypted but already decrypted this session
           generalInvoice = inv.invoice;
         } else if (options.decryptKey) {
-          // Try explicit decrypt key first
           try {
             const result = await inv.decrypt(options.decryptKey);
             generalInvoice = result.invoice;
           } catch {
-            // Ignore decrypt failure and fall through
             generalInvoice = undefined;
           }
         }
 
-        // ── Still unavailable → partial export ────────────────────────────────
+        // Unavailable plaintext becomes a partial export rather than being
+        // silently dropped from the CSV.
         if (!generalInvoice) {
           const unavailable = columns
             .filter((col) => {
@@ -2853,7 +3525,6 @@ export class MajikInvoice {
           });
         }
 
-        // ── Build the row ──────────────────────────────────────────────────────
         const ctx: CSVResolveContext = {
           invoice: generalInvoice,
           public: inv.public,
@@ -2862,7 +3533,7 @@ export class MajikInvoice {
 
         rows.push(buildCSVRow(ctx, columns));
       } catch (err) {
-        // Hard failure — skip this invoice's row but record the error
+        // Record hard export failures without aborting the rest of the batch.
         errors.push({
           invoiceId: inv.id,
           reason: err instanceof Error ? err.message : String(err),
@@ -2882,22 +3553,33 @@ export class MajikInvoice {
     };
   }
 
-  // ── duplicate ─────────────────────────────────────────────────────────────
+  // ── Duplication ───────────────────────────────────────────────────────────
 
   /**
-   * Duplicate this invoice, assigning a new UUID and resetting it to draft.
+   * Create a new invoice derived from this invoice.
    *
-   * The duplicate is always returned as an unsigned "signed-only" invoice —
-   * no signatures, no seal, no payments. All financial data (line items, taxes,
-   * parties, dates, references, notes, tags, metadata) is preserved.
+   * Duplication intentionally creates a new business document:
    *
-   * For encrypted invoices, decryptKey is required to access the inner
-   * GeneralInvoice. The duplicate is always "signed-only" — re-encrypt via
-   * toEncrypted() if needed.
+   * - new invoice ID
+   * - draft status
+   * - no signatures
+   * - no seal
+   * - no payments
    *
-   * @throws {MajikInvoiceError}           if encrypted and no decryptKey provided
-   * @throws {MajikInvoiceKeyError}        if decryptKey is locked or missing ML-KEM key
-   * @throws {MajikInvoiceEncryptionError} if decryption fails
+   * Financial structure, parties, taxes, dates, references, notes, tags,
+   * and metadata are preserved.
+   *
+   * Existing invoice numbers are incremented through the package's numeric
+   * sequence helper when possible.
+   *
+   * Encrypted invoices require decryption access before duplication and are
+   * returned as signed-only invoices.
+   *
+   * @param decryptKey - Optional key required when the source is encrypted.
+   * @returns A new unsigned draft MajikInvoice.
+   * @throws {@link MajikInvoiceError} When encrypted plaintext is unavailable.
+   * @throws {@link MajikInvoiceKeyError} When the supplied decryption key is unusable.
+   * @throws {@link MajikInvoiceEncryptionError} When decryption fails.
    */
   async duplicate(decryptKey?: MajikKey): Promise<MajikInvoice> {
     let gi: GeneralInvoice;
@@ -2919,7 +3601,7 @@ export class MajikInvoice {
       gi = this._requirePlaintextInvoice("duplicate");
     }
 
-    // Build a fresh GeneralInvoice with a new id, status draft, no payments
+    // Build a fresh GeneralInvoice with a new id, draft status, and no payments.
     const baseInput = gi.toMajikInvoiceInput();
 
     const incrementedInvoiceNumber = !!baseInput.invoiceNumber?.trim()
@@ -2928,7 +3610,7 @@ export class MajikInvoice {
 
     const clonedGi = GeneralInvoice.create({
       ...baseInput,
-      id: undefined, // generateUUID() picks a new id inside create()
+      id: undefined,
       status: "draft",
       invoiceNumber: incrementedInvoiceNumber,
     });
@@ -2962,16 +3644,17 @@ export class MajikInvoice {
   }
 
   /**
-   * Duplicate an array of MajikInvoice instances concurrently.
+   * Duplicate multiple invoices concurrently.
    *
-   * Signed-only invoices are duplicated directly.
-   * Encrypted invoices require decryptKey — those without a usable key are
-   * collected in the errors array and excluded from duplicated.
+   * Encrypted invoices require a decryption key. Individual failures are
+   * collected so successful duplicates can still be returned.
    *
-   * Each duplicate receives a new UUID, draft status, and no payments/signatures.
+   * Each duplicate receives its own new ID, draft status, and fresh unsigned
+   * cryptographic state.
    *
-   * @param invoices   - Invoices to duplicate
-   * @param decryptKey - Optional unlocked key for decrypting encrypted invoices
+   * @param invoices - Invoices to duplicate.
+   * @param decryptKey - Optional decryption key for encrypted invoices.
+   * @returns Batch duplication result.
    */
   static async batchDuplicate(
     invoices: MajikInvoice[],
@@ -3002,8 +3685,14 @@ export class MajikInvoice {
     return { duplicated, errors };
   }
 
+  // ==========================================================================
+  // ── SEND / RETENTION HELPERS
+  // ==========================================================================
+
   /**
-   * Checks if this.sentAt is a valid date.
+   * Determine whether `sentAt` exists and can be parsed as a valid date.
+   *
+   * @returns `true` when `sentAt` is present and represents a valid date.
    */
   public hasValidSentAt(): boolean {
     if (!this.sentAt) return false;
@@ -3014,12 +3703,19 @@ export class MajikInvoice {
   }
 
   /**
-   * Returns true if sentAt exists, is valid,
-   * and is older than the specified number of days.
+   * Determine whether the invoice is older than a specified number of days
+   * from its `sentAt` timestamp.
    *
-   * Example:
-   *   isPastDeletionWindow(30)
-   *   -> true if sentAt is more than 30 days ago
+   * Returns `false` when `sentAt` is absent or invalid.
+   *
+   * @param days - Retention/deletion-window length in days.
+   * @returns `true` when the elapsed time since `sentAt` is greater than
+   * the supplied number of days.
+   *
+   * @example
+   * ```ts
+   * invoice.isPastDeletionWindow(30);
+   * ```
    */
   public isPastDeletionWindow(days: number): boolean {
     if (!this.hasValidSentAt()) return false;
@@ -3034,10 +3730,24 @@ export class MajikInvoice {
     return diffDays > days;
   }
 
+  /**
+   * Get the sent timestamp as a JavaScript `Date`.
+   *
+   * Falls back to the public issue date when no valid `sentAt` timestamp exists.
+   */
   get sentDate(): Date {
     return this.hasValidSentAt() ? new Date(this.sentAt!) : this.issueDate;
   }
 
+  /**
+   * Determine whether a key is the initial signer/issuer of the invoice.
+   *
+   * The issuer is identified by the first signer entry in the signature set.
+   *
+   * @param key - Key whose fingerprint should be compared.
+   * @returns `true` when the key matches the first signer.
+   * @throws {@link MajikInvoiceKeyError} When a valid fingerprint-bearing key is not supplied.
+   */
   isIssuer(key: MajikKey): boolean {
     if (!key || !key?.fingerprint) {
       throw new MajikInvoiceKeyError(
@@ -3050,30 +3760,45 @@ export class MajikInvoice {
     return initSigner === key.fingerprint;
   }
 
-  /**
-   * SYNCING METHODS
-   */
-
-  // ── 1. Content equality (hash only) ──────────────────────────────────────
+  // ==========================================================================
+  // ── SYNCING
+  // ==========================================================================
 
   /**
-   * Returns true if both invoices have the same content hash.
-   * Does NOT check id, invoice number, mode, or any other field.
-   * Use this to detect whether financial content has changed between two copies.
+   * Compare two invoices using only their canonical content hash.
+   *
+   * This deliberately ignores:
+   *
+   * - invoice ID
+   * - invoice number
+   * - mode
+   * - lifecycle status
+   * - updated timestamp
+   *
+   * It answers only whether the committed invoice content is identical.
+   *
+   * @param a - First invoice.
+   * @param b - Second invoice.
+   * @returns `true` when both content hashes are identical.
    */
   static isSameContent(a: MajikInvoice, b: MajikInvoice): boolean {
     return a.integrity.contentHash === b.integrity.contentHash;
   }
 
-  // ── 2. Full sync equality (id + invoice number + hash) ───────────────────
-
   /**
-   * Returns true if two invoices represent the same document and
-   * neither side has diverged — same id, same invoice number, and same
-   * content hash.
+   * Determine whether two invoices are fully synchronized.
    *
-   * Use this as the "skip sync" guard: if isSynced returns true, the
-   * local and remote copies are identical and no transfer is needed.
+   * A pair is considered synchronized when they have:
+   *
+   * - the same invoice ID
+   * - the same invoice number
+   * - the same content hash
+   *
+   * This is appropriate as a "no sync work required" guard.
+   *
+   * @param a - First invoice.
+   * @param b - Second invoice.
+   * @returns `true` when both copies represent the same synchronized document.
    */
   static isSynced(a: MajikInvoice, b: MajikInvoice): boolean {
     if (a.id !== b.id) return false;
@@ -3081,15 +3806,17 @@ export class MajikInvoice {
     return MajikInvoice.isSameContent(a, b);
   }
 
-  // ── 3. Latest by updatedAt ────────────────────────────────────────────────
-
   /**
-   * Returns the invoice with the later updatedAt timestamp.
-   * If both timestamps are identical, `a` is returned (first argument wins).
+   * Return whichever invoice has the later `updatedAt` timestamp.
    *
-   * Use this when you've already determined a conflict exists and simply
-   * want the newest copy. For full conflict resolution with strategy options,
-   * use resolveConflict().
+   * If the timestamps are equal, the first argument wins.
+   *
+   * This method does not inspect content or resolve conflicts semantically;
+   * it only compares update timestamps.
+   *
+   * @param a - First invoice.
+   * @param b - Second invoice.
+   * @returns Invoice with the later update timestamp, or `a` on a tie.
    */
   static latest(a: MajikInvoice, b: MajikInvoice): MajikInvoice {
     const tA = new Date(a.updatedAt).getTime();
@@ -3097,17 +3824,24 @@ export class MajikInvoice {
     return tB > tA ? b : a;
   }
 
-  // ── 4. Structured diff ────────────────────────────────────────────────────
-
   /**
-   * Returns a structured diff between two invoice instances.
-   * Both invoices should share the same id for a diff to be meaningful,
-   * but this is not enforced — cross-id diffs are valid for fingerprinting.
+   * Produce a structured comparison of two invoice envelopes.
    *
-   * updatedAtDeltaMs is (a.updatedAt - b.updatedAt):
-   *   positive → a is newer
-   *   negative → b is newer (remote is ahead)
-   *   zero     → identical timestamps
+   * The diff reports:
+   *
+   * - whether committed content is identical
+   * - whether invoice numbers match
+   * - whether modes match
+   * - whether public statuses match
+   * - update timestamp delta
+   * - whether the content hash changed
+   *
+   * Cross-ID comparisons are allowed even though synchronization workflows
+   * normally compare invoices with the same ID.
+   *
+   * @param a - First invoice.
+   * @param b - Second invoice.
+   * @returns Structured invoice difference.
    */
   static diff(a: MajikInvoice, b: MajikInvoice): InvoiceDiff {
     return {
@@ -3121,19 +3855,30 @@ export class MajikInvoice {
     };
   }
 
-  // ── 5. Batch sync status ──────────────────────────────────────────────────
-
   /**
-   * Compare a local array against a remote array and classify every invoice.
+   * Compare local and remote invoice collections and classify every invoice.
    *
-   * Classification rules (matched by id):
-   *   synced     — same id, same hash (isSynced returns true)
-   *   conflict   — same id, different hash (both sides have diverged)
-   *   localOnly  — id found only in local array (needs upload)
-   *   remoteOnly — id found only in remote array (needs download)
+   * Matching is performed by invoice ID.
    *
-   * Conflicts include a full InvoiceDiff so you can decide whether to
-   * auto-resolve or surface them to the user.
+   * Classification:
+   *
+   * - `synced`
+   *   Same ID and same content hash.
+   *
+   * - `conflicts`
+   *   Same ID but different content hashes.
+   *
+   * - `localOnly`
+   *   Present only in the local collection.
+   *
+   * - `remoteOnly`
+   *   Present only in the remote collection.
+   *
+   * Conflicts include a full {@link InvoiceDiff} for downstream handling.
+   *
+   * @param local - Local invoice collection.
+   * @param remote - Remote invoice collection.
+   * @returns Batch synchronization classification.
    */
   static batchSyncStatus(
     local: MajikInvoice[],
@@ -3176,20 +3921,25 @@ export class MajikInvoice {
     return { synced, conflicts, localOnly, remoteOnly };
   }
 
-  // ── 6. Conflict resolution ────────────────────────────────────────────────
-
   /**
-   * Resolve a conflict between a local and remote copy of the same invoice.
+   * Resolve a local/remote synchronization conflict using an explicit strategy.
    *
-   * Strategies:
-   *   "latest-wins" — winner is the copy with the later updatedAt (default)
-   *   "local-wins"  — always prefer the local copy
-   *   "remote-wins" — always prefer the remote copy
+   * Supported strategies:
    *
-   * Returns { winner, loser, strategy } so the caller knows which direction
-   * to push and can log the outcome.
+   * - `local-wins` — return local as winner
+   * - `remote-wins` — return remote as winner
+   * - `latest-wins` — compare `updatedAt` and use the newer copy
    *
-   * @throws {MajikInvoiceError} if local.id !== remote.id
+   * When timestamps are equal under `latest-wins`, the local copy wins.
+   *
+   * This method does not merge fields. It selects one complete invoice
+   * instance as the winner and exposes the other as the loser.
+   *
+   * @param local - Local invoice copy.
+   * @param remote - Remote invoice copy.
+   * @param strategy - Conflict-selection strategy.
+   * @returns Winner, loser, and the strategy used.
+   * @throws {@link MajikInvoiceError} When the two invoices have different IDs.
    */
   static resolveConflict(
     local: MajikInvoice,
@@ -3227,7 +3977,7 @@ export class MajikInvoice {
           winner = remote;
           loser = local;
         } else {
-          // Tie also goes to local — local is the source of truth when equal.
+          // Equal timestamps also resolve to local.
           winner = local;
           loser = remote;
         }
@@ -3240,8 +3990,13 @@ export class MajikInvoice {
 }
 
 /**
- * Remove duplicate invoices by invoice id while preserving order.
- * First occurrence wins.
+ * Remove duplicate MajikInvoice instances by invoice ID.
+ *
+ * Only the first occurrence of each ID is retained; original input ordering
+ * is preserved.
+ *
+ * @param invoices - Invoice collection to deduplicate.
+ * @returns A new array containing the first invoice for each unique ID.
  */
 export function dedupeInvoices(invoices: MajikInvoice[]): MajikInvoice[] {
   const seen = new Set<string>();
