@@ -26,6 +26,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  ALLOWED_TRANSITIONS,
   GeneralInvoice,
   InvoiceLifecycleError,
   InvoiceMutationError,
@@ -1540,17 +1541,8 @@ describe("GeneralInvoice", () => {
     });
 
     describe("allowedTransitions()", () => {
-      const expected: Record<InvoiceStatus, InvoiceStatus[]> = {
-        draft: ["draft", "issued", "void"],
-        issued: ["sent", "viewed", "partial", "paid", "disputed", "void"],
-        sent: ["viewed", "partial", "paid", "disputed", "void"],
-        viewed: ["partial", "paid", "disputed", "void"],
-        partial: ["paid", "disputed", "void"],
-        paid: ["void"],
-        overdue: ["paid", "partial", "disputed", "void"],
-        disputed: ["issued", "void"],
-        void: [],
-      };
+      const expected: Record<InvoiceStatus, InvoiceStatus[]> =
+        ALLOWED_TRANSITIONS;
 
       it.each(Object.entries(expected))(
         "returns the correct destinations from %s",
