@@ -52,6 +52,7 @@
     "package": "npm run build && npm version patch && git push && git push --tags",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:csv": "vitest run test/csv-export.test.ts",
     "test:gi": "vitest run test/general-invoice.test.ts",
     "test:li": "vitest run test/line-item.test.ts",
     "test:totals": "vitest run test/invoice-totals.test.ts",

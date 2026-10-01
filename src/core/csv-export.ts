@@ -1,12 +1,31 @@
 /**
  * @file csv-export.ts
- * @description CSV export primitives for GeneralInvoice and MajikInvoice.
+ * @description Shared CSV-export primitives used by both `GeneralInvoice` and
+ * `MajikInvoice`.
  *
- * Three moving parts:
+ * This module defines the complete column-driven CSV export system:
  *
- *   1. CSVColumn<T>         — a typed column descriptor with a resolve function
- *   2. DEFAULT_CSV_COLUMNS  — curated default set, grouped by category
- *   3. ALL_CSV_COLUMNS      — every available column; use for the checkbox UI
+ * 1. `CSVColumn` — a typed column descriptor containing the machine key,
+ *    display label, logical UI group, and value resolver.
+ * 2. `DEFAULT_CSV_COLUMNS` — the curated set of commonly useful columns used
+ *    by standard exports.
+ * 3. `ALL_CSV_COLUMNS` — the complete catalog of static columns available to
+ *    the export-column selection UI.
+ * 4. `buildTaxBreakdownColumns()` — dynamically creates columns for specific
+ *    tax types discovered in an invoice population.
+ * 5. CSV helpers — shared utilities for header construction, row generation,
+ *    deduplication, escaping, and date normalization.
+ *
+ * The column architecture allows the same export engine to work with:
+ *
+ * - a fully accessible `GeneralInvoice`;
+ * - a `MajikInvoice` whose encrypted invoice has already been decrypted;
+ * - a locked encrypted `MajikInvoice`, where only its public summary is
+ *   available.
+ *
+ * Column resolvers are intentionally designed to degrade gracefully. Missing
+ * information should produce an empty CSV cell rather than causing the entire
+ * export to fail.
  *
  * Usage:
  *   // GeneralInvoice — single export
@@ -15,10 +34,13 @@
  *
  *   // MajikInvoice — batch export
  *   const result = await MajikInvoice.batchExportToCSV(invoices);
- *   const custom  = await MajikInvoice.batchExportToCSV(invoices, { columns: myColumns });
+ *   const custom = await MajikInvoice.batchExportToCSV(invoices, {
+ *     columns: myColumns,
+ *   });
  */
 
 import type { GeneralInvoice } from "./general-invoice";
+
 import type { PublicInvoiceSummary } from "./types"; // MajikInvoice public summary
 
 // ---------------------------------------------------------------------------
@@ -26,29 +48,84 @@ import type { PublicInvoiceSummary } from "./types"; // MajikInvoice public summ
 // ---------------------------------------------------------------------------
 
 /**
- * Result returned by MajikInvoice.batchExportToCSV().
+ * Result returned by `MajikInvoice.batchExportToCSV()`.
+ *
+ * The result contains the generated CSV together with aggregate export
+ * information describing whether every invoice was exported with complete
+ * data, whether some invoices had to fall back to public-only information,
+ * and whether any rows could not be generated.
  */
 export interface CSVExportResult {
-  /** The full CSV string — header row + one data row per invoice */
-  csv: string;
-  /** Total number of invoices processed */
-  count: number;
   /**
-   * true if every invoice was exported with full data.
-   * false if any invoice was encrypted and fell back to public-only fields,
-   * or if any invoice errored during row generation.
+   * The complete CSV document as a string.
+   *
+   * Includes the header row followed by one data row for each invoice that
+   * was processed.
+   */
+  csv: string;
+
+  /**
+   * Total number of invoices processed by the export operation.
+   */
+  count: number;
+
+  /**
+   * Indicates whether every invoice was exported with full available data.
+   *
+   * `false` indicates that at least one invoice:
+   *
+   * - was encrypted but had no decrypted cache, causing a public-only
+   *   fallback; or
+   * - encountered an error while generating its row.
    */
   success: boolean;
-  /** Invoices that were exported but with limited (public-only) data */
+
+  /**
+   * Invoices that were successfully included in the CSV but only with
+   * limited/publicly available data.
+   *
+   * This occurs when the full `GeneralInvoice` is unavailable, such as for
+   * an encrypted invoice that has not been decrypted during the current
+   * session.
+   */
   partialExports: Array<{
+    /**
+     * Identifier of the invoice that was exported partially.
+     */
     invoiceId: string;
+
+    /**
+     * Why the invoice could only be exported with limited data.
+     *
+     * - `encrypted-no-cache` — the invoice is encrypted and no decrypted
+     *   runtime cache is available.
+     * - `invoice-unavailable` — the underlying invoice data could not be
+     *   accessed for another reason.
+     */
     reason: "encrypted-no-cache" | "invoice-unavailable";
-    /** Column keys that could not be resolved and were left blank */
+
+    /**
+     * Column keys whose values could not be resolved because the required
+     * invoice data was unavailable.
+     *
+     * These columns are represented by blank cells in the generated CSV.
+     */
     unavailableColumns: string[];
   }>;
-  /** Invoices that could not be exported at all (row generation threw) */
+
+  /**
+   * Invoices that could not be exported at all because row generation
+   * encountered an error.
+   */
   errors: Array<{
+    /**
+     * Identifier of the invoice whose row could not be generated.
+     */
     invoiceId: string;
+
+    /**
+     * Description of the error encountered while exporting the invoice.
+     */
     reason: string;
   }>;
 }
@@ -57,6 +134,12 @@ export interface CSVExportResult {
 // Column group discriminant — used for the checkbox-grid UI
 // ---------------------------------------------------------------------------
 
+/**
+ * Logical category assigned to a CSV column.
+ *
+ * These groups provide a stable vocabulary for organizing exportable fields
+ * in the column-selection/checkbox UI.
+ */
 export type CSVColumnGroup =
   | "identity" // id, invoiceNumber, type, status
   | "parties" // issuer, recipient
@@ -73,16 +156,29 @@ export type CSVColumnGroup =
 // ---------------------------------------------------------------------------
 
 /**
- * A single column definition for CSV export.
+ * Describes one exportable CSV column.
  *
- * `resolve` receives whichever data is available:
- *   - `invoice`  — the full GeneralInvoice (always present for signed-only,
- *                  present for encrypted if already decrypted this session)
- *   - `public`   — MajikInvoice public summary (always available, even when
- *                  the GeneralInvoice cannot be accessed)
+ * A `CSVColumn` contains both the presentation metadata required to build the
+ * CSV header and the resolver responsible for extracting the corresponding
+ * cell value from an invoice context.
  *
- * Columns SHOULD degrade gracefully — return an empty string if neither
- * source has the data, rather than throwing.
+ * The same column descriptor can therefore be reused across:
+ *
+ * - `GeneralInvoice.toCSV()`;
+ * - `MajikInvoice.batchExportToCSV()`;
+ * - custom export configurations;
+ * - column-selection UIs.
+ *
+ * `resolve` receives whichever invoice information is currently available:
+ *
+ * - `invoice` — the full `GeneralInvoice`, available for signed-only invoices
+ *   and for encrypted invoices that have already been decrypted during the
+ *   current session.
+ * - `public` — the `MajikInvoice` public summary, available even when the full
+ *   invoice remains inaccessible.
+ *
+ * Columns should be resilient to partial access. A resolver should return an
+ * empty string when the requested field is unavailable instead of throwing.
  *
  * @example
  * const invoiceNumberCol: CSVColumn = {
@@ -94,32 +190,71 @@ export type CSVColumnGroup =
  * };
  */
 export interface CSVColumn {
-  /** Unique machine key — used for deduplication and column selection */
-  key: string;
-  /** Human-readable header label printed in the CSV */
-  label: string;
-  /** Logical grouping for the checkbox UI */
-  group: CSVColumnGroup;
   /**
-   * Extract the cell value.
-   * Must NOT throw — return "" for missing data.
+   * Unique machine-readable identifier for the column.
+   *
+   * The key is used for column deduplication, selection, and dynamic
+   * column composition. It should remain stable for a given logical field.
+   */
+  key: string;
+
+  /**
+   * Human-readable column heading written into the CSV header row.
+   */
+  label: string;
+
+  /**
+   * Logical UI category used to group the column in the export-selection
+   * interface.
+   */
+  group: CSVColumnGroup;
+
+  /**
+   * Resolves the value to place in this column's CSV cell.
+   *
+   * The resolver receives a `CSVResolveContext` containing the invoice data
+   * currently available to the exporter.
+   *
+   * Resolvers must not throw for expected missing-data scenarios. Return
+   * `""` when the requested information is unavailable.
    */
   resolve: (ctx: CSVResolveContext) => string;
 }
 
 /**
- * Context passed to each column's `resolve` function.
+ * Data context supplied to a `CSVColumn.resolve()` function.
  *
- * `invoice` is undefined when the MajikInvoice is encrypted and has not
- * been decrypted this session. Columns that only live on GeneralInvoice
- * should handle this gracefully.
+ * This context deliberately separates the full invoice from the public
+ * summary so the CSV system can export encrypted invoices without requiring
+ * access to their decrypted contents.
+ *
+ * `invoice` is undefined when the full `GeneralInvoice` is unavailable, such
+ * as when an encrypted `MajikInvoice` has not been decrypted during the
+ * current session.
  */
 export interface CSVResolveContext {
-  /** Full GeneralInvoice — undefined for locked encrypted invoices */
+  /**
+   * Full business invoice data.
+   *
+   * Undefined for locked encrypted invoices where the `GeneralInvoice` is not
+   * currently available.
+   */
   invoice?: GeneralInvoice;
-  /** Always-available public summary from MajikInvoice */
+
+  /**
+   * Public `MajikInvoice` summary.
+   *
+   * This remains available even when the full encrypted invoice cannot be
+   * accessed.
+   */
   public?: PublicInvoiceSummary;
-  /** The raw MajikInvoice id (always present) */
+
+  /**
+   * Raw `MajikInvoice` identifier.
+   *
+   * This value is always available and provides a stable fallback for the
+   * invoice ID column.
+   */
   invoiceId: string;
 }
 
@@ -127,14 +262,37 @@ export interface CSVResolveContext {
 // CSV escape helper
 // ---------------------------------------------------------------------------
 
+/**
+ * Options controlling CSV value escaping.
+ */
 export interface CSVEscapeOptions {
+  /**
+   * Preserve newline characters in values instead of flattening multiline
+   * content into a single line.
+   */
   preserveNewlines?: boolean;
 }
 
-/** RFC 4180 — wrap in quotes and escape internal quotes by doubling them */
+/**
+ * Escape a value for CSV output using RFC-style quoting rules.
+ *
+ * The helper:
+ *
+ * - converts nullish values to an empty string;
+ * - normalizes line endings to `\n`;
+ * - removes null bytes;
+ * - optionally flattens multiline content;
+ * - prefixes potentially executable spreadsheet formulas to reduce
+ *   Excel-style CSV injection risk;
+ * - wraps values containing commas, quotes, or newlines in double quotes;
+ * - doubles internal double quotes according to CSV escaping rules.
+ *
+ * @param value Value to convert into a CSV-safe cell.
+ * @param options Optional escaping behavior.
+ * @returns A CSV-safe string representation of the value.
+ */
 function esc(value: unknown, options?: CSVEscapeOptions): string {
   if (value == null) return "";
-
   let str = String(value);
 
   // normalize line endings
@@ -163,12 +321,19 @@ function esc(value: unknown, options?: CSVEscapeOptions): string {
 
   return str;
 }
+
 // ---------------------------------------------------------------------------
 // Column definitions
 // ---------------------------------------------------------------------------
 
 // ── Identity ──────────────────────────────────────────────────────────────
 
+/**
+ * Exports the invoice's stable identifier.
+ *
+ * Uses the `GeneralInvoice` ID when available and falls back to the raw
+ * `MajikInvoice` ID otherwise.
+ */
 const COL_ID: CSVColumn = {
   key: "id",
   label: "Invoice ID",
@@ -176,6 +341,11 @@ const COL_ID: CSVColumn = {
   resolve: ({ invoice, invoiceId }) => invoice?.id ?? invoiceId,
 };
 
+/**
+ * Exports the human-facing invoice number.
+ *
+ * Falls back to the public summary when the full invoice is unavailable.
+ */
 const COL_INVOICE_NUMBER: CSVColumn = {
   key: "invoiceNumber",
   label: "Invoice Number",
@@ -184,6 +354,12 @@ const COL_INVOICE_NUMBER: CSVColumn = {
     invoice?.invoiceNumber ?? pub?.invoiceNumber ?? "",
 };
 
+/**
+ * Exports the invoice document type.
+ *
+ * Uses the full invoice when available and otherwise falls back to the public
+ * summary.
+ */
 const COL_TYPE: CSVColumn = {
   key: "type",
   label: "Invoice Type",
@@ -192,6 +368,12 @@ const COL_TYPE: CSVColumn = {
     invoice?.type ?? pub?.invoiceType ?? "",
 };
 
+/**
+ * Exports the current invoice lifecycle status.
+ *
+ * Uses the full invoice status when available and otherwise falls back to the
+ * public summary status.
+ */
 const COL_STATUS: CSVColumn = {
   key: "status",
   label: "Invoice Status",
@@ -199,6 +381,12 @@ const COL_STATUS: CSVColumn = {
   resolve: ({ invoice, public: pub }) => invoice?.status ?? pub?.status ?? "",
 };
 
+/**
+ * Exports the invoice payment status.
+ *
+ * This identity-level payment field is available from either the full invoice
+ * or the public summary.
+ */
 const COL_PAYMENT_STATUS_IDENTITY: CSVColumn = {
   key: "paymentStatus",
   label: "Payment Status",
@@ -209,6 +397,11 @@ const COL_PAYMENT_STATUS_IDENTITY: CSVColumn = {
 
 // ── Parties ───────────────────────────────────────────────────────────────
 
+/**
+ * Exports the issuer's legal name.
+ *
+ * Falls back to the public summary when full invoice data is unavailable.
+ */
 const COL_ISSUER_NAME: CSVColumn = {
   key: "issuerName",
   label: "Issuer Name",
@@ -217,6 +410,11 @@ const COL_ISSUER_NAME: CSVColumn = {
     invoice?.issuer.legalName ?? pub?.issuerName ?? "",
 };
 
+/**
+ * Exports the issuer's taxpayer identification number.
+ *
+ * Requires access to the full `GeneralInvoice`.
+ */
 const COL_ISSUER_TIN: CSVColumn = {
   key: "issuerTin",
   label: "Issuer TIN",
@@ -224,6 +422,11 @@ const COL_ISSUER_TIN: CSVColumn = {
   resolve: ({ invoice }) => invoice?.issuer.tin ?? "",
 };
 
+/**
+ * Exports the issuer's email address.
+ *
+ * Requires access to the full `GeneralInvoice`.
+ */
 const COL_ISSUER_EMAIL: CSVColumn = {
   key: "issuerEmail",
   label: "Issuer Email",
@@ -231,6 +434,12 @@ const COL_ISSUER_EMAIL: CSVColumn = {
   resolve: ({ invoice }) => invoice?.issuer.email ?? "",
 };
 
+/**
+ * Exports the issuer's address as a single comma-separated field.
+ *
+ * Empty address components are omitted before the remaining components are
+ * joined.
+ */
 const COL_ISSUER_ADDRESS: CSVColumn = {
   key: "issuerAddress",
   label: "Issuer Address",
@@ -238,6 +447,7 @@ const COL_ISSUER_ADDRESS: CSVColumn = {
   resolve: ({ invoice }) => {
     const a = invoice?.issuer.address;
     if (!a) return "";
+
     return [
       a.line1,
       a.line2,
@@ -251,6 +461,11 @@ const COL_ISSUER_ADDRESS: CSVColumn = {
   },
 };
 
+/**
+ * Exports the recipient's legal name.
+ *
+ * Falls back to the public summary when full invoice data is unavailable.
+ */
 const COL_RECIPIENT_NAME: CSVColumn = {
   key: "recipientName",
   label: "Recipient Name",
@@ -259,6 +474,11 @@ const COL_RECIPIENT_NAME: CSVColumn = {
     invoice?.recipient.legalName ?? pub?.recipientName ?? "",
 };
 
+/**
+ * Exports the recipient's taxpayer identification number.
+ *
+ * Requires access to the full `GeneralInvoice`.
+ */
 const COL_RECIPIENT_TIN: CSVColumn = {
   key: "recipientTin",
   label: "Recipient TIN",
@@ -266,6 +486,11 @@ const COL_RECIPIENT_TIN: CSVColumn = {
   resolve: ({ invoice }) => invoice?.recipient.tin ?? "",
 };
 
+/**
+ * Exports the recipient's email address.
+ *
+ * Requires access to the full `GeneralInvoice`.
+ */
 const COL_RECIPIENT_EMAIL: CSVColumn = {
   key: "recipientEmail",
   label: "Recipient Email",
@@ -273,6 +498,12 @@ const COL_RECIPIENT_EMAIL: CSVColumn = {
   resolve: ({ invoice }) => invoice?.recipient.email ?? "",
 };
 
+/**
+ * Exports the recipient's address as a single comma-separated field.
+ *
+ * Empty address components are omitted before the remaining components are
+ * joined.
+ */
 const COL_RECIPIENT_ADDRESS: CSVColumn = {
   key: "recipientAddress",
   label: "Recipient Address",
@@ -280,6 +511,7 @@ const COL_RECIPIENT_ADDRESS: CSVColumn = {
   resolve: ({ invoice }) => {
     const a = invoice?.recipient.address;
     if (!a) return "";
+
     return [
       a.line1,
       a.line2,
@@ -295,6 +527,12 @@ const COL_RECIPIENT_ADDRESS: CSVColumn = {
 
 // ── Dates ─────────────────────────────────────────────────────────────────
 
+/**
+ * Exports the invoice issue date in normalized `YYYY-MM-DD` form.
+ *
+ * Falls back to the public summary's `issuedAt` value when the full invoice
+ * is unavailable.
+ */
 const COL_ISSUE_DATE: CSVColumn = {
   key: "issueDate",
   label: "Issue Date",
@@ -303,6 +541,12 @@ const COL_ISSUE_DATE: CSVColumn = {
     normalizeDate(invoice?.issueDate ?? pub?.issuedAt),
 };
 
+/**
+ * Exports the invoice due date in normalized `YYYY-MM-DD` form.
+ *
+ * Falls back to the public summary's due date when the full invoice is
+ * unavailable.
+ */
 const COL_DUE_DATE: CSVColumn = {
   key: "dueDate",
   label: "Due Date",
@@ -311,6 +555,9 @@ const COL_DUE_DATE: CSVColumn = {
     normalizeDate(invoice?.dueDate ?? pub?.dueDate),
 };
 
+/**
+ * Exports the beginning of the invoice's service or billing period.
+ */
 const COL_PERIOD_START: CSVColumn = {
   key: "periodStart",
   label: "Period Start",
@@ -318,6 +565,9 @@ const COL_PERIOD_START: CSVColumn = {
   resolve: ({ invoice }) => invoice?.period?.start ?? "",
 };
 
+/**
+ * Exports the end of the invoice's service or billing period.
+ */
 const COL_PERIOD_END: CSVColumn = {
   key: "periodEnd",
   label: "Period End",
@@ -325,6 +575,9 @@ const COL_PERIOD_END: CSVColumn = {
   resolve: ({ invoice }) => invoice?.period?.end ?? "",
 };
 
+/**
+ * Exports the invoice's payment terms.
+ */
 const COL_PAYMENT_TERMS: CSVColumn = {
   key: "paymentTerms",
   label: "Payment Terms",
@@ -334,6 +587,11 @@ const COL_PAYMENT_TERMS: CSVColumn = {
 
 // ── Totals ────────────────────────────────────────────────────────────────
 
+/**
+ * Exports the invoice currency code.
+ *
+ * Falls back to the public summary when the full invoice is unavailable.
+ */
 const COL_CURRENCY: CSVColumn = {
   key: "currency",
   label: "Currency",
@@ -342,6 +600,11 @@ const COL_CURRENCY: CSVColumn = {
     invoice?.currency ?? pub?.currency ?? "",
 };
 
+/**
+ * Exports the invoice subtotal before discounts and taxes.
+ *
+ * Requires access to the full invoice.
+ */
 const COL_SUBTOTAL: CSVColumn = {
   key: "subtotal",
   label: "Subtotal",
@@ -350,6 +613,9 @@ const COL_SUBTOTAL: CSVColumn = {
     invoice != null ? String(invoice.subtotalAmount.toFixed(2)) : "",
 };
 
+/**
+ * Exports the total discount amount applied to the invoice.
+ */
 const COL_DISCOUNT_TOTAL: CSVColumn = {
   key: "discountTotal",
   label: "Total Discount",
@@ -358,6 +624,9 @@ const COL_DISCOUNT_TOTAL: CSVColumn = {
     invoice != null ? String(invoice.discountAmount.toFixed(2)) : "",
 };
 
+/**
+ * Exports the aggregate tax amount.
+ */
 const COL_TAX_TOTAL: CSVColumn = {
   key: "taxTotal",
   label: "Total Tax",
@@ -366,6 +635,9 @@ const COL_TAX_TOTAL: CSVColumn = {
     invoice != null ? String(invoice.taxAmount.toFixed(2)) : "",
 };
 
+/**
+ * Exports the aggregate withholding amount.
+ */
 const COL_WITHHOLDING_TOTAL: CSVColumn = {
   key: "withholdingTotal",
   label: "Total Withholding",
@@ -374,6 +646,12 @@ const COL_WITHHOLDING_TOTAL: CSVColumn = {
     invoice != null ? String(invoice.withholdingAmount.toFixed(2)) : "",
 };
 
+/**
+ * Exports the invoice grand total.
+ *
+ * When the full invoice is available, the canonical invoice total is used.
+ * Otherwise, the public summary total is used when present.
+ */
 const COL_GRAND_TOTAL: CSVColumn = {
   key: "grandTotal",
   label: "Grand Total",
@@ -385,6 +663,9 @@ const COL_GRAND_TOTAL: CSVColumn = {
   },
 };
 
+/**
+ * Exports the amount remaining after withholding adjustments.
+ */
 const COL_NET_PAYABLE: CSVColumn = {
   key: "netPayable",
   label: "Net Payable",
@@ -393,6 +674,11 @@ const COL_NET_PAYABLE: CSVColumn = {
     invoice != null ? String(invoice.netPayableAmount.toFixed(2)) : "",
 };
 
+/**
+ * Exports the invoice's effective tax rate as a percentage string.
+ *
+ * Example: `0.125` becomes `12.50%`.
+ */
 const COL_EFFECTIVE_TAX_RATE: CSVColumn = {
   key: "effectiveTaxRate",
   label: "Effective Tax Rate",
@@ -401,6 +687,11 @@ const COL_EFFECTIVE_TAX_RATE: CSVColumn = {
     invoice != null ? `${(invoice.effectiveTaxRate * 100).toFixed(2)}%` : "",
 };
 
+/**
+ * Exports the invoice's already-formatted total representation.
+ *
+ * Falls back to the public summary when the full invoice is unavailable.
+ */
 const COL_FORMATTED_TOTAL: CSVColumn = {
   key: "formattedTotal",
   label: "Formatted Total",
@@ -411,6 +702,9 @@ const COL_FORMATTED_TOTAL: CSVColumn = {
 
 // ── Payment ───────────────────────────────────────────────────────────────
 
+/**
+ * Exports the cumulative amount already paid against the invoice.
+ */
 const COL_TOTAL_PAID: CSVColumn = {
   key: "totalPaid",
   label: "Total Paid",
@@ -419,6 +713,9 @@ const COL_TOTAL_PAID: CSVColumn = {
     invoice != null ? String(invoice.totalPaid.toMajor().toFixed(2)) : "",
 };
 
+/**
+ * Exports the remaining amount currently due.
+ */
 const COL_AMOUNT_DUE: CSVColumn = {
   key: "amountDue",
   label: "Amount Due",
@@ -427,6 +724,9 @@ const COL_AMOUNT_DUE: CSVColumn = {
     invoice != null ? String(invoice.amountDue.toMajor().toFixed(2)) : "",
 };
 
+/**
+ * Exports whether the invoice is fully paid.
+ */
 const COL_IS_FULLY_PAID: CSVColumn = {
   key: "isFullyPaid",
   label: "Fully Paid",
@@ -435,6 +735,9 @@ const COL_IS_FULLY_PAID: CSVColumn = {
     invoice != null ? String(invoice.isFullyPaid) : "",
 };
 
+/**
+ * Exports the number of recorded proof-of-payment entries.
+ */
 const COL_PAYMENT_COUNT: CSVColumn = {
   key: "paymentCount",
   label: "Payment Count",
@@ -445,6 +748,12 @@ const COL_PAYMENT_COUNT: CSVColumn = {
 
 // ── Line Items (summary — not per-row expansion) ──────────────────────────
 
+/**
+ * Exports the number of line items on the invoice.
+ *
+ * Line items remain summarized into a single invoice row rather than being
+ * expanded into separate CSV records.
+ */
 const COL_LINE_ITEM_COUNT: CSVColumn = {
   key: "lineItemCount",
   label: "Line Item Count",
@@ -453,6 +762,11 @@ const COL_LINE_ITEM_COUNT: CSVColumn = {
     invoice != null ? String(invoice.lineItemCount) : "",
 };
 
+/**
+ * Exports all line-item descriptions into a single cell.
+ *
+ * Individual descriptions are separated by ` | `.
+ */
 const COL_LINE_ITEM_DESCRIPTIONS: CSVColumn = {
   key: "lineItemDescriptions",
   label: "Line Item Descriptions",
@@ -463,6 +777,12 @@ const COL_LINE_ITEM_DESCRIPTIONS: CSVColumn = {
       : "",
 };
 
+/**
+ * Exports all line-item quantities into a single cell.
+ *
+ * Individual quantities are separated by ` | ` and remain aligned with the
+ * order of the invoice's line items.
+ */
 const COL_LINE_ITEM_QUANTITIES: CSVColumn = {
   key: "lineItemQuantities",
   label: "Line Item Quantities",
@@ -473,6 +793,12 @@ const COL_LINE_ITEM_QUANTITIES: CSVColumn = {
       : "",
 };
 
+/**
+ * Exports all line-item unit prices into a single cell.
+ *
+ * Monetary values are rendered to two decimal places and separated by
+ * ` | `.
+ */
 const COL_LINE_ITEM_UNIT_PRICES: CSVColumn = {
   key: "lineItemUnitPrices",
   label: "Line Item Unit Prices",
@@ -485,6 +811,11 @@ const COL_LINE_ITEM_UNIT_PRICES: CSVColumn = {
       : "",
 };
 
+/**
+ * Exports all line-item net totals into a single cell.
+ *
+ * Values are rendered to two decimal places and separated by ` | `.
+ */
 const COL_LINE_ITEM_NET_TOTALS: CSVColumn = {
   key: "lineItemNetTotals",
   label: "Line Item Net Totals",
@@ -497,6 +828,11 @@ const COL_LINE_ITEM_NET_TOTALS: CSVColumn = {
 
 // ── Accounting ────────────────────────────────────────────────────────────
 
+/**
+ * Exports the invoice's associated cost centers as a single cell.
+ *
+ * Multiple cost centers are separated by ` | `.
+ */
 const COL_COST_CENTERS: CSVColumn = {
   key: "costCenters",
   label: "Cost Centers",
@@ -504,6 +840,11 @@ const COL_COST_CENTERS: CSVColumn = {
   resolve: ({ invoice }) => invoice?.costCenters.join(" | ") ?? "",
 };
 
+/**
+ * Exports the invoice's account codes as a single cell.
+ *
+ * Multiple account codes are separated by ` | `.
+ */
 const COL_ACCOUNT_CODES: CSVColumn = {
   key: "accountCodes",
   label: "Account Codes",
@@ -511,6 +852,11 @@ const COL_ACCOUNT_CODES: CSVColumn = {
   resolve: ({ invoice }) => invoice?.accountCodes.join(" | ") ?? "",
 };
 
+/**
+ * Exports the tax types associated with the invoice as a single cell.
+ *
+ * Multiple tax types are separated by ` | `.
+ */
 const COL_TAX_TYPES: CSVColumn = {
   key: "taxTypes",
   label: "Tax Types",
@@ -520,6 +866,9 @@ const COL_TAX_TYPES: CSVColumn = {
 
 // ── Meta ──────────────────────────────────────────────────────────────────
 
+/**
+ * Exports the invoice's free-form notes.
+ */
 const COL_NOTES: CSVColumn = {
   key: "notes",
   label: "Notes",
@@ -527,6 +876,10 @@ const COL_NOTES: CSVColumn = {
   resolve: ({ invoice }) => invoice?.notes ?? "",
 };
 
+/**
+ * Exports the invoice's tags as a comma-separated list within a single CSV
+ * field.
+ */
 const COL_TAGS: CSVColumn = {
   key: "tags",
   label: "Tags",
@@ -539,11 +892,14 @@ const COL_TAGS: CSVColumn = {
 // ---------------------------------------------------------------------------
 
 /**
- * Every available static column (non-dynamic tax breakdown columns).
- * Use this to populate the checkbox-grid UI.
+ * Complete catalog of every available static CSV column.
  *
- * Dynamic per-taxType columns are generated at export time via
- * `buildTaxBreakdownColumns()` below.
+ * This collection contains all built-in, non-dynamic column definitions and
+ * is intended primarily for column-selection UIs such as a checkbox grid.
+ *
+ * Dynamic per-tax-type columns are not included here because their keys and
+ * labels depend on the tax types present in the invoice population. Generate
+ * those separately with `buildTaxBreakdownColumns()`.
  */
 export const ALL_CSV_COLUMNS: CSVColumn[] = [
   // identity
@@ -552,6 +908,7 @@ export const ALL_CSV_COLUMNS: CSVColumn[] = [
   COL_TYPE,
   COL_STATUS,
   COL_PAYMENT_STATUS_IDENTITY,
+
   // parties
   COL_ISSUER_NAME,
   COL_ISSUER_TIN,
@@ -561,12 +918,14 @@ export const ALL_CSV_COLUMNS: CSVColumn[] = [
   COL_RECIPIENT_TIN,
   COL_RECIPIENT_EMAIL,
   COL_RECIPIENT_ADDRESS,
+
   // dates
   COL_ISSUE_DATE,
   COL_DUE_DATE,
   COL_PERIOD_START,
   COL_PERIOD_END,
   COL_PAYMENT_TERMS,
+
   // totals
   COL_CURRENCY,
   COL_SUBTOTAL,
@@ -577,29 +936,40 @@ export const ALL_CSV_COLUMNS: CSVColumn[] = [
   COL_NET_PAYABLE,
   COL_EFFECTIVE_TAX_RATE,
   COL_FORMATTED_TOTAL,
+
   // payment
   COL_TOTAL_PAID,
   COL_AMOUNT_DUE,
   COL_IS_FULLY_PAID,
   COL_PAYMENT_COUNT,
+
   // line items
   COL_LINE_ITEM_COUNT,
   COL_LINE_ITEM_DESCRIPTIONS,
   COL_LINE_ITEM_QUANTITIES,
   COL_LINE_ITEM_UNIT_PRICES,
   COL_LINE_ITEM_NET_TOTALS,
+
   // accounting
   COL_COST_CENTERS,
   COL_ACCOUNT_CODES,
   COL_TAX_TYPES,
+
   // meta
   COL_NOTES,
   COL_TAGS,
 ];
 
 /**
- * Default column set — the essentials shown in a standard export.
- * This is what `toCSV()` and `batchExportToCSV()` use when no columns are provided.
+ * Curated default set of CSV columns used by standard exports.
+ *
+ * This is the column set used by `toCSV()` and
+ * `batchExportToCSV()` when the caller does not provide an explicit
+ * selection.
+ *
+ * The default intentionally focuses on the most broadly useful invoice
+ * identity, party, date, monetary, and payment fields without including every
+ * available metadata or accounting field.
  */
 export const DEFAULT_CSV_COLUMNS: CSVColumn[] = [
   COL_ID,
@@ -625,12 +995,24 @@ export const DEFAULT_CSV_COLUMNS: CSVColumn[] = [
 // ---------------------------------------------------------------------------
 
 /**
- * Build per-taxType additive tax columns dynamically from a known set of
- * tax types. Useful when you know the tax types present in your invoice
- * population up front (e.g. ["VAT", "EXCISE"]).
+ * Build additive-tax and withholding columns for a set of tax types.
  *
- * These complement ALL_CSV_COLUMNS for the checkbox UI — call this after
- * scanning your invoices and merge into your column list.
+ * Each supplied tax type produces two CSV columns:
+ *
+ * - `<TAX_TYPE> Amount` — additive tax total for that tax type.
+ * - `<TAX_TYPE> Withholding` — withholding total for that tax type.
+ *
+ * Tax types are normalized to uppercase for both generated keys and labels.
+ *
+ * This builder is useful when the tax types present across an invoice
+ * population are known ahead of export, such as `["VAT", "EWT"]`.
+ *
+ * The generated columns complement `ALL_CSV_COLUMNS`; they are not included
+ * in the static catalog because their exact set is population-dependent.
+ *
+ * @param taxTypes Tax type identifiers for which dynamic columns should be
+ * generated.
+ * @returns A new array containing two columns for each supplied tax type.
  *
  * @example
  * const taxCols = buildTaxBreakdownColumns(["VAT", "EWT"]);
@@ -638,6 +1020,7 @@ export const DEFAULT_CSV_COLUMNS: CSVColumn[] = [
  */
 export function buildTaxBreakdownColumns(taxTypes: string[]): CSVColumn[] {
   const cols: CSVColumn[] = [];
+
   for (const taxType of taxTypes) {
     const upper = taxType.toUpperCase();
 
@@ -661,6 +1044,7 @@ export function buildTaxBreakdownColumns(taxTypes: string[]): CSVColumn[] {
       },
     });
   }
+
   return cols;
 }
 
@@ -668,12 +1052,30 @@ export function buildTaxBreakdownColumns(taxTypes: string[]): CSVColumn[] {
 // Helpers used by GeneralInvoice.toCSV() and MajikInvoice.batchExportToCSV()
 // ---------------------------------------------------------------------------
 
-/** Build a single CSV header row from a column list */
+/**
+ * Build the CSV header row for a given column set.
+ *
+ * Each column's human-readable `label` becomes one CSV header cell, escaped
+ * using the module's standard CSV escaping rules.
+ *
+ * @param columns Columns to include in the header, in output order.
+ * @returns A single CSV header row.
+ */
 export function buildCSVHeader(columns: CSVColumn[]): string {
   return columns.map((c) => esc(c.label)).join(",");
 }
 
-/** Build a single CSV data row given a context and column list */
+/**
+ * Build one CSV data row from a resolver context and column list.
+ *
+ * Each column resolver is executed independently. A resolver that throws
+ * does not abort the entire row; the affected cell is replaced with an empty
+ * string and the error is logged for debugging.
+ *
+ * @param ctx Data available to column resolvers.
+ * @param columns Columns to resolve, in output order.
+ * @returns A single CSV data row.
+ */
 export function buildCSVRow(
   ctx: CSVResolveContext,
   columns: CSVColumn[],
@@ -690,15 +1092,45 @@ export function buildCSVRow(
     .join(",");
 }
 
+/**
+ * Remove duplicate columns while preserving their first occurrence.
+ *
+ * Deduplication is based on the column's machine `key`. When multiple column
+ * descriptors share the same key, only the first one is retained.
+ *
+ * @param columns Column descriptors to deduplicate.
+ * @returns A new array containing only the first occurrence of each column
+ * key.
+ */
 export function dedupeColumns(columns: CSVColumn[]): CSVColumn[] {
   const seen = new Set<string>();
+
   return columns.filter((c) => {
     if (seen.has(c.key)) return false;
+
     seen.add(c.key);
     return true;
   });
 }
 
+/**
+ * Normalize a date-like value into `YYYY-MM-DD`.
+ *
+ * Supports:
+ *
+ * - `Date` instances;
+ * - date strings;
+ * - numeric date values accepted by the JavaScript `Date` constructor.
+ *
+ * Invalid or unsupported values return an empty string.
+ *
+ * The resulting date uses the ISO representation and is truncated to the
+ * calendar-date portion, keeping CSV output stable and Excel-friendly.
+ *
+ * @param value Date-like value to normalize.
+ * @returns A normalized `YYYY-MM-DD` string, or `""` when the value cannot
+ * be interpreted as a valid date.
+ */
 function normalizeDate(value: unknown): string {
   if (!value) return "";
 
@@ -708,7 +1140,9 @@ function normalizeDate(value: unknown): string {
     date = value;
   } else if (typeof value === "string" || typeof value === "number") {
     const parsed = new Date(value);
+
     if (isNaN(parsed.getTime())) return "";
+
     date = parsed;
   } else {
     return "";

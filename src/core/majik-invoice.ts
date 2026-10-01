@@ -1718,7 +1718,7 @@ export class MajikInvoice {
     recipients: MajikRecipient[],
     signerKey?: MajikKey,
   ): Promise<MajikInvoice> {
-    return this.setMode("encrypted-and-signed", { recipients, signerKey });
+    return this.toEncrypted(recipients, this.recipients, signerKey);
   }
 
   /**
@@ -2405,29 +2405,56 @@ export class MajikInvoice {
     }
 
     if (!this.payload) {
-      errors.push({ field: "payload", message: "Payload is required" });
-    } else if (this.payload.kind === "signed-only") {
-      if (!this.payload.invoice) {
-        errors.push({
-          field: "payload.invoice",
-          message: "Invoice JSON is required for signed-only mode",
-        });
-      }
-    } else if (this.payload.kind === "encrypted-and-signed") {
-      if (!this.payload.envelopeString) {
-        errors.push({
-          field: "payload.envelopeString",
-          message: "Envelope string is required for encrypted mode",
-        });
-      }
+      errors.push({
+        field: "payload",
+        message: "Payload is required",
+      });
+    } else {
+      const payloadKind = this.payload.kind;
+
       if (
-        !this.payload.recipientFingerprints ||
-        this.payload.recipientFingerprints.length === 0
+        payloadKind !== "signed-only" &&
+        payloadKind !== "encrypted-and-signed"
       ) {
         errors.push({
-          field: "payload.recipientFingerprints",
-          message: "At least one recipient fingerprint is required",
+          field: "payload.kind",
+          message: `Unsupported payload kind: "${String(payloadKind)}"`,
         });
+      } else {
+        if (payloadKind !== this.mode) {
+          errors.push({
+            field: "payload.kind",
+            message: `Payload kind "${payloadKind}" does not match invoice mode "${this.mode}"`,
+          });
+        }
+
+        if (payloadKind === "signed-only") {
+          if (!this.payload.invoice) {
+            errors.push({
+              field: "payload.invoice",
+              message: "Invoice JSON is required for signed-only mode",
+            });
+          }
+        }
+
+        if (payloadKind === "encrypted-and-signed") {
+          if (!this.payload.envelopeString) {
+            errors.push({
+              field: "payload.envelopeString",
+              message: "Envelope string is required for encrypted mode",
+            });
+          }
+
+          if (
+            !this.payload.recipientFingerprints ||
+            this.payload.recipientFingerprints.length === 0
+          ) {
+            errors.push({
+              field: "payload.recipientFingerprints",
+              message: "At least one recipient fingerprint is required",
+            });
+          }
+        }
       }
     }
 

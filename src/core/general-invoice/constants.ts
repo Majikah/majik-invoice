@@ -175,7 +175,7 @@ export const ALLOWED_TRANSITIONS: Record<InvoiceStatus, InvoiceStatus[]> = {
 
 * Issued invoices may proceed into delivery, settlement, dispute, or void.
   */
-  issued: ["sent", "viewed", "partial", "paid", "disputed", "void"],
+  issued: ["sent", "viewed", "partial", "paid", "disputed", "void", "overdue"],
 
   /**
 
