@@ -1280,6 +1280,8 @@ Cryptographic key and account-management library used throughout the Majikah eco
 
 MajikInvoice uses Majik Key material for signing and recipient-based cryptographic workflows.
 
+[Read more about Majik Key here](https://majikah.solutions/articles/majik-key-whitepaper)
+
 ## [Majik Signature](https://www.npmjs.com/package/@majikah/majik-signature)
 
 [![Majik Signature Hero](https://github.com/user-attachments/assets/e2843b67-a04c-4119-9ec2-196d746524b8)](https://signature.majikah.solutions)
