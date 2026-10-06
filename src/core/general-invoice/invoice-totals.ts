@@ -7,8 +7,8 @@ import {
   serializeMoney,
   deserializeMoney,
 } from "@thezelijah/majik-money";
-import type { InvoiceTotalsJSON, CurrencyCode } from "./types";
-import type { LineItem } from "./line-item";
+import type { InvoiceTotalsJSON, CurrencyCode } from "./types.js";
+import type { LineItem } from "./line-item.js";
 
 /**
  * Immutable aggregate of the monetary totals for an invoice.

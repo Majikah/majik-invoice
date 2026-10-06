@@ -9,9 +9,9 @@ import {
   CurrencyDefinition,
   CURRENCIES,
 } from "@thezelijah/majik-money";
-import { LineItem } from "./line-item";
-import { InvoiceTotals } from "./invoice-totals";
-import { TaxManager } from "./tax-manager";
+import { LineItem } from "./line-item.js";
+import { InvoiceTotals } from "./invoice-totals.js";
+import { TaxManager } from "./tax-manager.js";
 import type {
   Party,
   TaxDetail,
@@ -38,28 +38,28 @@ import type {
   InvoiceInternalState,
   ProofOfPayment,
   PaymentStatus,
-} from "./types";
-import { canonicalize, generateUUID } from "./utils";
+} from "./types.js";
+import { canonicalize, generateUUID } from "./utils.js";
 import {
   InvoiceLifecycleError,
   InvoiceMutationError,
   InvoiceProjectionError,
   InvoiceValidationError,
-} from "./errors";
+} from "./errors.js";
 import {
   ALLOWED_TRANSITIONS,
   DEFAULT_ACCOUNTS,
   SCHEMA_VERSION,
-} from "./constants";
-import { MajikInvoiceInput } from "../types";
+} from "./constants.js";
+import { MajikInvoiceInput } from "../types.js";
 import {
   buildCSVHeader,
   buildCSVRow,
   CSVColumn,
   CSVResolveContext,
   DEFAULT_CSV_COLUMNS,
-} from "../csv-export";
-import { encoder, sha256Hex } from "../crypto-utils";
+} from "../csv-export.js";
+import { encoder, sha256Hex } from "../crypto-utils.js";
 
 /**
  * Domain aggregate representing a complete invoice document.

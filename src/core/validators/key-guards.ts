@@ -1,5 +1,5 @@
 import type { MajikKey } from "@majikah/majik-key";
-import { MajikInvoiceKeyError } from "../errors";
+import { MajikInvoiceKeyError } from "../errors.js";
 
 export function assertKeyUnlocked(key: MajikKey, operation: string): void {
   if (key.isLocked) {

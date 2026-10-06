@@ -1,5 +1,5 @@
-import type { TaxDetail, TaxBehaviour } from "./types";
-import { InvoiceValidationError } from "./errors";
+import type { TaxDetail, TaxBehaviour } from "./types.js";
+import { InvoiceValidationError } from "./errors.js";
 
 /**
  * Immutable manager for a collection of {@link TaxDetail} entries.

@@ -22,13 +22,13 @@
  * the underlying business invoice represented by {@link GeneralInvoice}.
  */
 
-import { GeneralInvoice } from "./general-invoice";
+import { GeneralInvoice } from "./general-invoice/index.js";
 import type {
   GeneralInvoiceJSON,
   InvoiceStatus,
   PaymentStatus,
   ProofOfPayment,
-} from "./general-invoice";
+} from "./general-invoice/types.js";
 import { MajikSignature } from "@majikah/majik-signature";
 import type {
   ExpectedSigner,
@@ -48,12 +48,12 @@ import {
   decoder,
   sha256Hex,
   canonicalBytesForSigning,
-} from "./crypto-utils";
+} from "./crypto-utils.js";
 import {
   assertKeyUnlocked,
   assertKeyHasSigningKeys,
   assertKeyHasMlKem,
-} from "./validators/key-guards";
+} from "./validators/key-guards.js";
 import {
   ConflictResolutionStrategy,
   DashboardStats,
@@ -71,7 +71,7 @@ import {
   MajikInvoiceValidationResult,
   PublicInvoiceSummary,
   SignedOnlyPayload,
-} from "./types";
+} from "./types.js";
 import {
   MajikInvoiceEncryptionError,
   MajikInvoiceError,
@@ -79,8 +79,8 @@ import {
   MajikInvoiceSealError,
   MajikInvoiceSerializationError,
   MajikInvoiceSignatureError,
-} from "./errors";
-import { MJKI_HEADER_SIZE, MJKI_MAGIC, MJKI_VERSION } from "./binary";
+} from "./errors.js";
+import { MJKI_HEADER_SIZE, MJKI_MAGIC, MJKI_VERSION } from "./binary.js";
 import { MajikMoney } from "@thezelijah/majik-money";
 import {
   buildCSVHeader,
@@ -90,15 +90,15 @@ import {
   CSVResolveContext,
   dedupeColumns,
   DEFAULT_CSV_COLUMNS,
-} from "./csv-export";
-import { computeAllowlistHash } from "./signing";
+} from "./csv-export.js";
+import { computeAllowlistHash } from "./signing.js";
 import {
   createSignatureJSON,
   verifySignatureJSON,
   computeSealHashAsync,
-} from "./signing-service";
-import { buildEncryptedPayload } from "./encryption";
-import { incrementLastNumericSequence } from "./general-invoice/utils";
+} from "./signing-service.js";
+import { buildEncryptedPayload } from "./encryption.js";
+import { incrementLastNumericSequence } from "./general-invoice/utils.js";
 
 // ── Batch / statistics result types ──────────────────────────────────────
 

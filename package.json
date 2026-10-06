@@ -8,6 +8,18 @@
   "main": "./dist/index.js",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./invoice": {
+      "types": "./dist/core/general-invoice/index.d.ts",
+      "import": "./dist/core/general-invoice/index.js",
+      "default": "./dist/core/general-invoice/index.js"
+    }
+  },
   "files": [
     "dist"
   ],
@@ -65,7 +77,7 @@
     "@majikah/majik-signature": "^0.9.4",
     "@noble/hashes": "^2.4.0",
     "@stablelib/sha256": "^2.0.1",
-    "@thezelijah/majik-money": "^2.1.0",
+    "@thezelijah/majik-money": "^2.2.0",
     "uuid": "^14.0.2"
   },
   "devDependencies": {

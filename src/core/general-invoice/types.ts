@@ -17,7 +17,7 @@
 * `LineItem`, `InvoiceTotals`, and higher-level invoice APIs.
   */
 
-import { LineItem } from "./line-item";
+import { LineItem } from "./line-item.js";
 
 // ---------------------------------------------------------------------------
 // ISO Primitives

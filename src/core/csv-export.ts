@@ -39,9 +39,9 @@
  *   });
  */
 
-import type { GeneralInvoice } from "./general-invoice";
+import type { GeneralInvoice } from "./general-invoice/general-invoice.js";
 
-import type { PublicInvoiceSummary } from "./types"; // MajikInvoice public summary
+import type { PublicInvoiceSummary } from "./types.js"; // MajikInvoice public summary
 
 // ---------------------------------------------------------------------------
 // Return type — add near the other Batch types (BatchDecryptResult, etc.)

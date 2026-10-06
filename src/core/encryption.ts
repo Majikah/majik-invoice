@@ -1,7 +1,7 @@
 import type { MajikKey } from "@majikah/majik-key";
 import { MajikEnvelope, type MajikRecipient } from "@majikah/majik-envelope";
-import { MajikInvoiceEncryptionError } from "./errors";
-import type { EncryptedPayload } from "./types";
+import { MajikInvoiceEncryptionError } from "./errors.js";
+import type { EncryptedPayload } from "./types.js";
 
 export async function buildEncryptedPayload(
   invoice: any,

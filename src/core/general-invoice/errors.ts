@@ -2,7 +2,7 @@
 // Errors
 // ---------------------------------------------------------------------------
 
-import { InvoiceStatus } from "./types";
+import { InvoiceStatus } from "./types.js";
 
 export class InvoiceValidationError extends Error {
   constructor(

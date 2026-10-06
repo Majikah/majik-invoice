@@ -7,9 +7,9 @@ import {
   serializeMoney,
   deserializeMoney,
 } from "@thezelijah/majik-money";
-import type { LineItemInput, LineItemJSON, Discount } from "./types";
-import { TaxManager } from "./tax-manager";
-import { resolveTaxes } from "./utils";
+import type { LineItemInput, LineItemJSON, Discount } from "./types.js";
+import { TaxManager } from "./tax-manager.js";
+import { resolveTaxes } from "./utils.js";
 
 /**
  * Validation error thrown when a {@link LineItem} input or calculated value

@@ -1,4 +1,4 @@
-import { encoder } from "./crypto-utils";
+import { encoder } from "./crypto-utils.js";
 import { MajikSignature } from "@majikah/majik-signature";
 import type { MajikKey } from "@majikah/majik-key";
 import type {

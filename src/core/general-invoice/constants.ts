@@ -16,7 +16,7 @@
 * `TaxManager`, and accounting projection utilities.
   */
 
-import { InvoiceStatus } from "./types";
+import { InvoiceStatus } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Schema version

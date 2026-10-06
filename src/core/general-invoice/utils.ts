@@ -1,6 +1,6 @@
 import { v4 as uuidv4 } from "uuid";
-import { TaxManager } from "./tax-manager";
-import { LineItemInput } from "./types";
+import { TaxManager } from "./tax-manager.js";
+import { LineItemInput } from "./types.js";
 
 export function generateUUID(): string {
   try {

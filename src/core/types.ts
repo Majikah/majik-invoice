@@ -37,7 +37,7 @@ import type {
   ISODateString,
   ISODateTimeString,
   PaymentStatus,
-} from "./general-invoice";
+} from "./general-invoice/index.js";
 import type {
   ExpectedSigner,
   MajikSignatureJSON,

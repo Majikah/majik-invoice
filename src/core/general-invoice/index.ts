@@ -6,12 +6,15 @@
  */
 
 // Types & interfaces
-export type * from "./types";
-export * from "./errors";
-export * from "./constants";
+export type * from "./types.js";
+export * from "./errors.js";
+export * from "./constants.js";
 
-export * from "./tax-manager";
+export * from "./tax-manager.js";
+export * from "./utils.js";
+
 // Classes
-export { LineItem, LineItemValidationError } from "./line-item";
-export { InvoiceTotals } from "./invoice-totals";
-export { GeneralInvoice } from "./general-invoice";
+export * from "./line-item.js";
+export * from "./invoice-totals.js";
+export * from "./general-invoice.js";
+
