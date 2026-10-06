@@ -60,9 +60,9 @@
     "test:core": "vitest run test/majik-invoice.test.ts"
   },
   "dependencies": {
-    "@majikah/majik-envelope": "^0.2.1",
-    "@majikah/majik-key": "^0.7.0",
-    "@majikah/majik-signature": "^0.7.2",
+    "@majikah/majik-envelope": "^0.3.0",
+    "@majikah/majik-key": "^1.0.2",
+    "@majikah/majik-signature": "^0.9.4",
     "@noble/hashes": "^2.4.0",
     "@stablelib/sha256": "^2.0.1",
     "@thezelijah/majik-money": "^2.1.0",
