@@ -74,7 +74,7 @@
   "dependencies": {
     "@majikah/majik-envelope": "^0.3.0",
     "@majikah/majik-key": "^1.0.2",
-    "@majikah/majik-signature": "^0.9.4",
+    "@majikah/majik-signature": "^0.10.0",
     "@noble/hashes": "^2.4.0",
     "@stablelib/sha256": "^2.0.1",
     "@thezelijah/majik-money": "^2.2.0",
